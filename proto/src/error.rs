@@ -133,6 +133,15 @@ mod tests {
     }
 
     #[test]
+    fn codes_are_documented_with_their_exit_codes() {
+        let doc = include_str!("../../docs/cli.md");
+        for c in ErrorCode::ALL {
+            let row = format!("| `{}` | {} |", c.as_str(), c.exit_code() as u8);
+            assert!(doc.contains(&row), "docs/cli.md lacks {row}");
+        }
+    }
+
+    #[test]
     fn codes_are_unique() {
         let mut seen = std::collections::HashSet::new();
         for c in ErrorCode::ALL {

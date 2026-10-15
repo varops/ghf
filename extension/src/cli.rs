@@ -96,6 +96,20 @@ pub enum Command {
     Hooks(HooksCommand),
     /// Hook entry point called by an agent harness (reads its payload on stdin).
     Hook { harness: Harness },
+    /// Install or print the agent skill that teaches ghf workflows.
+    #[command(subcommand)]
+    Skill(SkillCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SkillCommand {
+    /// Write the skill to .claude/skills/ghf/SKILL.md (project) or ~/.claude/skills (user).
+    Install {
+        #[arg(long, value_enum, default_value = "project")]
+        scope: Scope,
+    },
+    /// Print the skill.
+    Show,
 }
 
 #[derive(Debug, Subcommand)]
@@ -229,6 +243,8 @@ impl Command {
             Self::Login { .. } => "login",
             Self::Prune { .. } => "prune",
             Self::Hook { .. } => "hook",
+            Self::Skill(SkillCommand::Install { .. }) => "skill install",
+            Self::Skill(SkillCommand::Show) => "skill show",
             Self::Hooks(h) => match h {
                 HooksCommand::Install { .. } => "hooks install",
                 HooksCommand::Uninstall { .. } => "hooks uninstall",
@@ -257,6 +273,7 @@ impl Command {
             self,
             Self::Status
                 | Self::Hook { .. }
+                | Self::Skill(SkillCommand::Show)
                 | Self::Hooks(HooksCommand::Status { .. })
                 | Self::Trace(
                     TraceCommand::List { .. }

@@ -148,6 +148,28 @@ fn report(h: Harness, f: &Failure, strict: bool) -> i32 {
 // ---------------------------------------------------------------------------
 // install / uninstall
 
+/// The agent skill, embedded so it installs without a ghf checkout.
+pub const SKILL: &str = include_str!("../../skills/ghf/SKILL.md");
+
+/// Write the skill for Claude Code. Returns (path, changed).
+pub fn install_skill(scope: Scope, root: Option<&Path>) -> Result<(PathBuf, bool)> {
+    let base = match scope {
+        Scope::User => std::env::var("HOME")
+            .map(PathBuf::from)
+            .map_err(|_| err!(Config, "HOME is not set"))?,
+        Scope::Project | Scope::Local => root
+            .ok_or_else(|| err!(NotARepo, "not inside a Git worktree; use --scope user"))?
+            .to_path_buf(),
+    };
+    let path = base.join(".claude/skills/ghf/SKILL.md");
+    if fs::read_to_string(&path).is_ok_and(|t| t == SKILL) {
+        return Ok((path, false));
+    }
+    fs::create_dir_all(path.parent().expect("parent"))?;
+    fs::write(&path, SKILL).context(|| format!("write {}", path.display()))?;
+    Ok((path, true))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Scope {
     /// Shared project settings, committed with the repository.

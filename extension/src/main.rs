@@ -22,7 +22,7 @@ use clap::error::ErrorKind;
 use ghf_proto::{ErrorCode, ExitCode, Response};
 use serde_json::json;
 
-use cli::{Cli, Command, HooksCommand, TraceCommand};
+use cli::{Cli, Command, HooksCommand, SkillCommand, TraceCommand};
 use cmd::{Env, Out};
 use error::{Failure, Result};
 
@@ -152,6 +152,22 @@ fn dispatch(env: &Env, command: &Command) -> Result<Out> {
         Command::Login { server } => cmd::login(env, server.clone()),
         Command::Prune { dry_run } => cmd::prune(env, *dry_run),
         Command::Hook { .. } => unreachable!("handled in main"),
+        Command::Skill(SkillCommand::Show) => Ok(Out {
+            human: hooks::SKILL.trim_end().to_owned(),
+            data: json!({"skill": hooks::SKILL}),
+        }),
+        Command::Skill(SkillCommand::Install { scope }) => {
+            let root = git::Repo::discover(&env.cwd).map(|r| r.root);
+            let (path, changed) = hooks::install_skill(*scope, root.ok().as_deref())?;
+            Ok(Out {
+                human: format!(
+                    "{} {}",
+                    if changed { "wrote" } else { "up to date:" },
+                    path.display()
+                ),
+                data: json!({"path": path, "changed": changed}),
+            })
+        }
         Command::Hooks(h) => {
             let (harness, scope, action) = match h {
                 HooksCommand::Install { harness, scope } => (*harness, *scope, "install"),

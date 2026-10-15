@@ -1,50 +1,134 @@
 ---
 name: ghf
-description: Work safely in repositories that use ghf (Git High Frequency) checkpoints. Use when a repository has a `.ghf` file, when you need to roll back to an earlier working state, hand work to another agent or machine, fork an experiment, or show what was tried. Covers automatic capture, the manual `git hf checkpoint` fallback, restore vs apply vs fork, closing and finalizing traces, and the gaps capture does not cover.
+description: Work safely in Git repositories that use ghf (git hf) checkpoints. Use when a repository has a `.ghf` file, when you need to roll back to an earlier working state (for example the last state where tests passed), continue another agent's or machine's work, try an alternative approach from an earlier point, see what was tried, or move changes between worktrees. Covers automatic capture, the `git hf checkpoint` fallback, restore vs apply vs fork, closing and finalizing traces, and what capture does not see.
 ---
 
-# ghf
+# ghf: checkpoints for agent work
 
-> Status: stub. Sections are outlined from PRD §9.11 and get filled in as the CLI lands.
+ghf saves the state of your worktree after each edit. Each save is a **checkpoint**. The checkpoints for one unit of work form a **trace**. You can list, diff, restore, apply or fork any checkpoint, on this machine or another one.
 
-ghf records the state of your worktree after each edit as a **checkpoint**. Checkpoints for one unit of work form a **trace**. Traces never merge; accepted work still lands as ordinary Git commits.
+ghf never writes into Git. Finished work still lands as ordinary Git commits.
 
-## Detect ghf
+## 1. Detect ghf
 
-TODO: a `.ghf` file at the repo root; `git hf status --json`.
+A repository uses ghf if it has a `.ghf` file at its root. Check its state with:
 
-## One worktree per agent
+```bash
+git hf status --json
+```
 
-TODO: one active writer per worktree. Parallel agents use separate Git worktrees. `E_WRITER_LOCKED` means another writer owns this one.
+Always pass `--json` and act on `error.code`, never on message text. ghf never prompts when `--json` is set.
 
-## Capture
+## 2. One worktree per agent
 
-TODO: automatic capture through harness hooks after file-editing tool calls; `git hf checkpoint [-m "intent"] [--annotate tests=pass]` as the fallback.
+Only one writer may use a worktree's trace at a time. If two agents edit the same worktree, the second one gets `E_WRITER_LOCKED`.
 
-## What capture does not see
+For parallel work, give each agent its own Git worktree:
 
-Say this plainly to the user when it matters:
+```bash
+git worktree add ../task-b
+```
 
-- Hooks see tool calls. They do **not** see files written by shell scripts, code generators, or a human in an editor. Run `git hf checkpoint` after those.
-- The Git index (staged state) is **not** captured. Checkpoints hold the working tree only.
+Each worktree gets its own worktree context and its own trace.
 
-## Restore, apply, fork
+## 3. Capture
 
-TODO:
+**Automatic.** If the harness hooks are installed, every file edit and shell command creates a checkpoint. You do nothing. Install the hooks with:
 
-- `git hf trace restore <id>`: defaults to a new worktree. Prefer this.
-- `--in-place`: only when the tree matches the latest checkpoint; `E_WORKTREE_DIRTY` otherwise.
-- `git hf trace apply <a>..<b>`: three-way apply; stops on `E_APPLY_CONFLICT` with the tree unchanged.
-- `git hf trace fork <id>`: start an experiment in a new worktree and trace.
+```bash
+git hf hooks install claude-code   # or: cursor
+```
 
-## Close and finalize
+**Manual.** Call this yourself after edits the hooks cannot see, and to mark meaningful states:
 
-TODO: `git hf trace close`, then `git hf trace finalize --commit <sha>` or `--abandoned`.
+```bash
+git hf checkpoint -m "short intent" --annotate tests=pass
+```
 
-## Commit normally
+After running tests, mark the result with `--annotate tests=pass` or `--annotate tests=fail`. A pass annotation makes "last green" easy to find later. If nothing changed, a checkpoint with a message or annotation is still recorded.
 
-TODO: make ordinary Git commits. Never add ghf IDs, trailers or notes to commits.
+## 4. What capture does not see
 
-## Automation contract
+Tell the user plainly when either of these matters:
 
-TODO: always pass `--json`; branch on `error.code`, never on message text.
+- **Out-of-band writes.** Hooks fire on the agent's tool calls. They do not see files written by a background process, a code generator running outside a tool call, or a human in an editor. Run `git hf checkpoint` after those.
+- **Staged changes.** The Git index is not captured. Checkpoints hold the working tree only, so a restore does not bring back what was staged.
+
+Also never captured:
+
+- Paths matched by `.gitignore` or `.ghfignore`.
+- Files over the size limit. These are listed in the checkpoint's `skipped`.
+- Submodules.
+
+## 5. Find a checkpoint
+
+```bash
+git hf trace log --json                          # this worktree's trace, newest last
+git hf trace log --annotation tests=pass --json  # only green states
+git hf trace list --json                         # all traces, every machine (after sync)
+git hf trace diff @~3 @                          # compare two checkpoints
+git hf trace diff @~1                            # a checkpoint vs the working tree
+```
+
+Ways to name a checkpoint:
+
+- `@` is the latest checkpoint of this worktree's trace, and `@~N` is N before it.
+- A full id like `ck_…`, or a unique prefix of one.
+- A trace id like `tr_…`, which means that trace's latest checkpoint.
+
+## 6. Restore, apply, fork
+
+Pick the least destructive option.
+
+| Goal | Command | Safety |
+|---|---|---|
+| Look at or continue from an old state | `git hf trace restore <id>` | Creates a new worktree. The current one is untouched. **Prefer this.** |
+| Roll this worktree back (for example to last green) | `git hf trace restore <id> --in-place` | Refused with `E_WORKTREE_DIRTY` if anything is uncaptured. Checkpoint first, then retry. |
+| Roll back even with uncaptured edits | `git hf trace restore <id> --in-place --force` | Checkpoints the current state first, so it can be undone. |
+| Bring changes from another trace into this one | `git hf trace apply <a>..<b>` | Three-way merge. Stops on conflicts with `E_APPLY_CONFLICT` and leaves the tree unchanged. |
+| Bring in one checkpoint's own changes | `git hf trace apply <id>` | Same as `<parent>..<id>`. |
+| Try a different approach from a point | `git hf trace fork <id>` | New worktree, new trace. |
+
+Every restore and apply is recorded as a new checkpoint, so it can be undone.
+
+When `apply` reports conflicts, `data.conflicts` lists the paths and why. You have two options:
+
+- Resolve them by hand.
+- Re-run with `--write-conflicts`, which leaves standard conflict markers. Fix the markers, then run `git hf checkpoint`.
+
+### Roll back to last green
+
+```bash
+git hf trace log --annotation tests=pass --json   # take the last id
+git hf checkpoint                                 # capture anything pending
+git hf trace restore <id> --in-place
+```
+
+## 7. Hand off across machines
+
+1. **On the first machine,** run `git hf sync`. Sync also runs in the background after each checkpoint.
+2. **On the second machine,** run `git hf trust`, then `git hf sync`, then `git hf trace restore <id>`.
+
+The restore always creates a new worktree with a new context. It never reuses the original one.
+
+## 8. Finish
+
+1. Commit normally with `git add` and `git commit`. **Never** put ghf ids, trailers or notes in commit messages.
+2. Close the trace when the work is done: `git hf trace close`.
+3. After the commit lands on the main branch, finalize the trace with `git hf trace finalize --commit <sha>`. If the work was dropped, use `git hf trace finalize --abandoned` instead.
+4. To keep a trace from being pruned, use `git hf trace pin <trace>`. Release it with `unpin`.
+
+## 9. Error codes to handle
+
+| Code | Exit | Meaning | Do |
+|---|---|---|---|
+| `E_WRITER_LOCKED` | 3 | Another writer owns this worktree's trace | Use your own worktree. Use `--takeover` only if the owner is gone. |
+| `E_WORKTREE_DIRTY` | 3 | Uncaptured changes would be lost | `git hf checkpoint`, then retry, or restore into a new worktree |
+| `E_APPLY_CONFLICT` | 4 | Merge conflicts; the tree is unchanged | Resolve, or use `--write-conflicts` |
+| `E_NOT_FOUND` | 6 | Unknown checkpoint or trace | `git hf sync`, then retry |
+| `E_OBJECT_MISSING` | 6 | Content was pruned or never synced | Choose another checkpoint |
+| `E_NOT_SYNCED`, `E_SERVER` | 5 | Server unreachable | Work continues locally; sync later |
+| `E_UNTRUSTED_SERVER` | 5 | Server not trusted on this machine | Ask the user to run `git hf trust` |
+| `E_CAPTURE_FAILED` | 1 | Strict-mode capture failed | Stop and report to the user |
+
+The full reference is in `docs/cli.md` in the ghf repository.

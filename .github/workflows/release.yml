@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-14
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo test
+      - run: cargo build --release --locked --target ${{ matrix.target }} -p git-hf -p ghf-server
+      - name: Package
+        run: |
+          name=ghf-${GITHUB_REF_NAME}-${{ matrix.target }}
+          mkdir -p "dist/$name"
+          cp target/${{ matrix.target }}/release/git-hf target/${{ matrix.target }}/release/ghf-server "dist/$name/"
+          cp README.md CHANGELOG.md "dist/$name/"
+          cp -r skills docs "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          shasum -a 256 "dist/$name.tar.gz" > "dist/$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.tar.gz*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes=$(awk -v v="${GITHUB_REF_NAME#v}" '$0 ~ "^## " v {f=1; next} /^## /{f=0} f' CHANGELOG.md)
+          prerelease=""
+          case "$GITHUB_REF_NAME" in *-*) prerelease="--prerelease";; esac
+          gh release create "$GITHUB_REF_NAME" dist/* --title "ghf $GITHUB_REF_NAME" --notes "$notes" $prerelease

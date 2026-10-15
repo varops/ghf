@@ -566,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "ghf-proto"
-version = "0.0.1"
+version = "0.1.0-rc.1"
 dependencies = [
  "blake3",
  "serde",
@@ -576,7 +576,7 @@ dependencies = [
 
 [[package]]
 name = "ghf-server"
-version = "0.0.1"
+version = "0.1.0-rc.1"
 dependencies = [
  "axum",
  "axum-server",
@@ -592,7 +592,7 @@ dependencies = [
 
 [[package]]
 name = "git-hf"
-version = "0.0.1"
+version = "0.1.0-rc.1"
 dependencies = [
  "blake3",
  "clap",
