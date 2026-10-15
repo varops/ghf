@@ -21,6 +21,8 @@ ghf sits next to Git, not inside it. It writes nothing into commits, messages, r
 | Show a human what was tried | `git hf trace log` and `git hf trace diff <a> <b>` |
 | Survive a crashed worker | A checkpoint is acknowledged only after it is durable locally; sync catches up later |
 
+New here? Start with the [user guide](docs/guide.md).
+
 ## Install
 
 Requirements:
@@ -147,7 +149,7 @@ To see where time goes in one capture, set `GHF_TIMING=1`.
 | [`server/`](server) | `ghf-server` | Canonical store for checkpoints and traces |
 | [`proto/`](proto) | `ghf-proto` | Shared object format, records, API types and error codes |
 | [`skills/ghf/`](skills/ghf) | | Agent skill; `git hf skill install` writes it |
-| [`docs/`](docs) | | Concept, PRDs, CLI reference and server guide |
+| [`docs/`](docs) | | [User guide](docs/guide.md), [CLI reference](docs/cli.md), [server guide](docs/server.md), concept and PRDs |
 
 ## Development
 
