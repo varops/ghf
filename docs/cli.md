@@ -308,6 +308,7 @@ unfinalized_cap = "90d"
 | `GHF_ALLOW_INSECURE` | `1` allows plain `http://` to non-local hosts |
 | `GHF_GC_GRACE` | Minimum object age before local GC deletes it (default `1h`) |
 | `GHF_TIMING` | Print capture phase timings to stderr |
+| `GHF_NO_LISTING_CACHE` | Ask git for the file list on every capture instead of reusing it |
 
 ## Local state
 
@@ -316,4 +317,5 @@ Everything ghf keeps on a machine lives outside Git history:
 - `<git-common-dir>/ghf/ghf.db` holds the checkpoints, traces, content, stat cache and sync state. It is shared by all worktrees of the repository.
 - `<git-dir>/ghf/context.json` holds this worktree's context.
 - `<git-dir>/ghf/capture.lock` serializes captures in one worktree.
+- `<git-dir>/ghf/listing.json` caches this worktree's `git ls-files` result. It is reused only while the timestamps on the listed directories, the index and the ignore files are unchanged, and for at most 60 seconds.
 - `~/.config/ghf/` holds the machine id, trusted servers and credentials.

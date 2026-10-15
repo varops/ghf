@@ -55,20 +55,23 @@ pub fn ghfignore(root: &Path) -> Gitignore {
     b.build().unwrap_or_else(|_| Gitignore::empty())
 }
 
-/// Paths ghf captures in this worktree, relative and `/`-separated.
-pub fn captured_paths(repo: &Repo) -> Result<(Vec<String>, Vec<Skipped>)> {
-    let ignore = ghfignore(&repo.root);
-    let mut paths = Vec::new();
-    let mut skipped = Vec::new();
-    for raw in repo.list_files()? {
-        let Ok(path) = String::from_utf8(raw) else {
-            skipped.push(Skipped {
-                path: "<non-utf8>".into(),
-                reason: "non_utf8_path".into(),
-                size: None,
-            });
-            continue;
-        };
+/// Filter git's listing down to captured paths: drop `.ghfignore` matches,
+/// record unsafe and non-UTF-8 paths as skipped.
+fn captured(
+    ignore: &Gitignore,
+    files: Vec<String>,
+    other: &[Vec<u8>],
+    skipped: &mut Vec<Skipped>,
+) -> Vec<String> {
+    for _ in other {
+        skipped.push(Skipped {
+            path: "<non-utf8>".into(),
+            reason: "non_utf8_path".into(),
+            size: None,
+        });
+    }
+    let mut paths = Vec::with_capacity(files.len());
+    for path in files {
         let path = path.trim_end_matches('/').to_owned();
         if !path.split('/').all(ghf_proto::object::safe_name) {
             skipped.push(Skipped {
@@ -83,7 +86,14 @@ pub fn captured_paths(repo: &Repo) -> Result<(Vec<String>, Vec<Skipped>)> {
         }
         paths.push(path);
     }
-    Ok((paths, skipped))
+    paths
+}
+
+/// What one path contributes to a snapshot.
+enum Item {
+    File(FileEntry, Option<StatEntry>),
+    Skip(Skipped),
+    Absent,
 }
 
 fn mtime_ns(md: &fs::Metadata) -> i64 {
@@ -93,122 +103,52 @@ fn mtime_ns(md: &fs::Metadata) -> i64 {
 pub fn scan(repo: &Repo, store: &Store, opts: &ScanOptions) -> Result<Snapshot> {
     let started_ns = ghf_proto::id::now_ms().saturating_mul(1_000_000);
     let t = crate::timing::Timer::new();
-    let (paths, mut skipped) = captured_paths(repo)?;
-    t.mark("list files");
+    let ignore = ghfignore(&repo.root);
+    let listing = crate::listing::start(repo)?;
+    if std::env::var_os("GHF_TIMING").is_some() {
+        eprintln!(
+            "ghf timing: listing cache {}",
+            if listing.cached() { "hit" } else { "miss" }
+        );
+    }
     let cache = match &opts.context_id {
         Some(c) => store.load_statcache(c)?,
         None => HashMap::new(),
     };
     t.mark("load stat cache");
+
+    // Hash the last known paths while git refreshes the listing.
+    let mut items: HashMap<String, Item> = HashMap::new();
+    let mut ignored = Vec::new();
+    for path in captured(&ignore, listing.previous().to_vec(), &[], &mut ignored) {
+        let item = scan_path(repo, store, opts, &cache, started_ns, &path)?;
+        items.insert(path, item);
+    }
+    t.mark("hash files");
+    let (files_listed, other) = listing.finish()?;
+    t.mark("list files (wait)");
+    let mut skipped = Vec::new();
+    let paths = captured(&ignore, files_listed, &other, &mut skipped);
+
     let mut upserts = Vec::new();
     let mut files = Manifest::new();
     let mut bytes = 0u64;
-
-    for path in &paths {
-        let full = repo.root.join(path);
-        let md = match fs::symlink_metadata(&full) {
-            Ok(m) => m,
-            // Deleted tracked file: simply absent from this state.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => {
-                skipped.push(Skipped {
-                    path: path.clone(),
-                    reason: "unreadable".into(),
-                    size: None,
-                });
-                continue;
-            }
+    for path in paths {
+        let item = match items.remove(&path) {
+            Some(i) => i,
+            None => scan_path(repo, store, opts, &cache, started_ns, &path)?,
         };
-        let ft = md.file_type();
-        let mode = if ft.is_symlink() {
-            Mode::Symlink
-        } else if ft.is_file() {
-            if md.mode() & 0o111 != 0 {
-                Mode::Exec
-            } else {
-                Mode::File
-            }
-        } else {
-            // Submodules, nested repositories, sockets, fifos.
-            skipped.push(Skipped {
-                path: path.clone(),
-                reason: if ft.is_dir() {
-                    "submodule".into()
-                } else {
-                    "special_file".into()
-                },
-                size: None,
-            });
-            continue;
-        };
-        if mode != Mode::Symlink && md.len() > opts.max_file_size {
-            skipped.push(Skipped {
-                path: path.clone(),
-                reason: "too_large".into(),
-                size: Some(md.len()),
-            });
-            continue;
-        }
-        let mtime = mtime_ns(&md);
-        let cached = cache.get(path).filter(|c| {
-            c.size == md.len()
-                && c.mtime == mtime
-                && c.ino == md.ino()
-                && c.mode == mode
-                // Racy-clean protection: trust only files older than the scan.
-                && mtime < started_ns - 2_000_000_000
-                && (!opts.persist || store.has_object(&c.id))
-        });
-        let id = if let Some(c) = cached {
-            c.id
-        } else {
-            let content = if mode == Mode::Symlink {
-                fs::read_link(&full).map(|t| t.as_os_str().as_bytes().to_vec())
-            } else {
-                fs::read(&full)
-            };
-            let content = match content {
-                Ok(c) => c,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(_) => {
-                    skipped.push(Skipped {
-                        path: path.clone(),
-                        reason: "unreadable".into(),
-                        size: None,
-                    });
-                    continue;
+        match item {
+            Item::File(e, stat) => {
+                bytes += e.size;
+                if let Some(s) = stat {
+                    upserts.push((path.clone(), s));
                 }
-            };
-            let id = if opts.persist {
-                store.put(Kind::Blob, &content)?
-            } else {
-                object::hash(Kind::Blob, &content)
-            };
-            // Like Git's racily-clean rule: never cache a file modified so
-            // recently that a same-size rewrite could share its mtime.
-            if opts.persist && opts.context_id.is_some() && mtime < started_ns - 2_000_000_000 {
-                upserts.push((
-                    path.clone(),
-                    StatEntry {
-                        size: md.len(),
-                        mtime,
-                        ino: md.ino(),
-                        mode,
-                        id,
-                    },
-                ));
+                files.insert(path, e);
             }
-            id
-        };
-        bytes += md.len();
-        files.insert(
-            path.clone(),
-            FileEntry {
-                mode,
-                id,
-                size: md.len(),
-            },
-        );
+            Item::Skip(s) => skipped.push(s),
+            Item::Absent => {}
+        }
     }
 
     if let Some(ctx) = &opts.context_id
@@ -222,7 +162,7 @@ pub fn scan(repo: &Repo, store: &Store, opts: &ScanOptions) -> Result<Snapshot> 
         store.save_statcache(ctx, &upserts, &removed)?;
     }
 
-    t.mark("hash files");
+    t.mark("reconcile");
     let root = build_tree(&files, opts.persist.then_some(store))?;
     t.mark("build trees");
     Ok(Snapshot {
@@ -231,6 +171,92 @@ pub fn scan(repo: &Repo, store: &Store, opts: &ScanOptions) -> Result<Snapshot> 
         skipped,
         bytes,
     })
+}
+
+/// Stat (and if needed hash and store) one path.
+fn scan_path(
+    repo: &Repo,
+    store: &Store,
+    opts: &ScanOptions,
+    cache: &HashMap<String, StatEntry>,
+    started_ns: i64,
+    path: &str,
+) -> Result<Item> {
+    let skip = |reason: &str, size: Option<u64>| {
+        Ok(Item::Skip(Skipped {
+            path: path.to_owned(),
+            reason: reason.into(),
+            size,
+        }))
+    };
+    let full = repo.root.join(path);
+    let md = match fs::symlink_metadata(&full) {
+        Ok(m) => m,
+        // Deleted tracked file: simply absent from this state.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Item::Absent),
+        Err(_) => return skip("unreadable", None),
+    };
+    let ft = md.file_type();
+    let mode = if ft.is_symlink() {
+        Mode::Symlink
+    } else if ft.is_file() {
+        if md.mode() & 0o111 != 0 {
+            Mode::Exec
+        } else {
+            Mode::File
+        }
+    } else if ft.is_dir() {
+        // Submodules and nested repositories.
+        return skip("submodule", None);
+    } else {
+        return skip("special_file", None);
+    };
+    if mode != Mode::Symlink && md.len() > opts.max_file_size {
+        return skip("too_large", Some(md.len()));
+    }
+    let mtime = mtime_ns(&md);
+    // Racy-clean protection, as in Git: a file modified within two seconds of
+    // the scan is neither trusted from nor written to the stat cache.
+    let settled = mtime < started_ns - 2_000_000_000;
+    let hit = cache.get(path).filter(|c| {
+        settled
+            && c.size == md.len()
+            && c.mtime == mtime
+            && c.ino == md.ino()
+            && c.mode == mode
+            && (!opts.persist || store.has_object(&c.id))
+    });
+    let entry = |id| FileEntry {
+        mode,
+        id,
+        size: md.len(),
+    };
+    if let Some(c) = hit {
+        return Ok(Item::File(entry(c.id), None));
+    }
+    let content = if mode == Mode::Symlink {
+        fs::read_link(&full).map(|t| t.as_os_str().as_bytes().to_vec())
+    } else {
+        fs::read(&full)
+    };
+    let content = match content {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Item::Absent),
+        Err(_) => return skip("unreadable", None),
+    };
+    let id = if opts.persist {
+        store.put(Kind::Blob, &content)?
+    } else {
+        object::hash(Kind::Blob, &content)
+    };
+    let stat = (opts.persist && opts.context_id.is_some() && settled).then_some(StatEntry {
+        size: md.len(),
+        mtime,
+        ino: md.ino(),
+        mode,
+        id,
+    });
+    Ok(Item::File(entry(id), stat))
 }
 
 enum Node<'a> {

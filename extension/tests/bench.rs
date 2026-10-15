@@ -39,6 +39,25 @@ fn dir_bytes(p: &Path) -> u64 {
     total
 }
 
+/// Set every file and directory under `root` (except `.git`) to `ago` old.
+fn age_tree(root: &Path, ago: Duration) {
+    let t = std::time::SystemTime::now() - ago;
+    let times = fs::FileTimes::new().set_modified(t).set_accessed(t);
+    fn walk(p: &Path, times: fs::FileTimes) {
+        for e in fs::read_dir(p).unwrap().flatten() {
+            if e.file_name() == ".git" {
+                continue;
+            }
+            if e.file_type().unwrap().is_dir() {
+                walk(&e.path(), times);
+            }
+            fs::File::open(e.path()).unwrap().set_times(times).unwrap();
+        }
+    }
+    walk(root, times);
+    fs::File::open(root).unwrap().set_times(times).unwrap();
+}
+
 /// Deterministic pseudo-random generator so runs are comparable.
 struct Lcg(u64);
 impl Lcg {
@@ -83,9 +102,16 @@ fn bench_capture_sync_restore() {
     )
     .ok();
 
+    // A real checkout's files and directories are not seconds old; age the
+    // fixture so timestamp-based caches see what they would in practice.
+    age_tree(&work, Duration::from_secs(3600));
+
     let t = Instant::now();
     m.hf(&work, &["checkpoint"]).ok();
     let first = t.elapsed();
+    // Let the first listing settle past the racy window.
+    std::thread::sleep(Duration::from_millis(2100));
+    m.hf(&work, &["checkpoint"]).ok();
 
     let mut lat = Vec::with_capacity(edits);
     for e in 0..edits {
@@ -102,6 +128,20 @@ fn bench_capture_sync_restore() {
         r.ok();
     }
     lat.sort();
+
+    // New files change the file set, so git must list it again.
+    let creates = (edits / 4).max(1);
+    let mut lat_new = Vec::with_capacity(creates);
+    for e in 0..creates {
+        let i = rng.next() as usize % files;
+        let p = work.join(format!("src/m{:02}/s{:02}/new{e}.rs", i % 40, i % 7));
+        fs::write(&p, format!("// new {e}\n")).unwrap();
+        let t = Instant::now();
+        let r = m.hf(&work, &["checkpoint"]);
+        lat_new.push(t.elapsed());
+        r.ok();
+    }
+    lat_new.sort();
     let local = dir_bytes(&work.join(".git/ghf"));
 
     let t = Instant::now();
@@ -129,6 +169,7 @@ fn bench_capture_sync_restore() {
         "repo_bytes": repo_bytes,
         "first_checkpoint_ms": first.as_secs_f64() * 1000.0,
         "checkpoint_ms": {"p50": pct(&lat, 0.5), "p95": pct(&lat, 0.95), "max": pct(&lat, 1.0)},
+        "new_file_checkpoint_ms": {"n": creates, "p50": pct(&lat_new, 0.5), "p95": pct(&lat_new, 0.95), "max": pct(&lat_new, 1.0)},
         "local_store_bytes_incl_metadata": local,
         "server_store_bytes_incl_metadata": server_bytes,
         "server_bytes_per_checkpoint": server_bytes as f64 / (edits + 1) as f64,

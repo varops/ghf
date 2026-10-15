@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Performance
+
+- **Faster edits.** A checkpoint after editing existing files reuses the last `git ls-files` listing, so it no longer starts git. Before reusing it, ghf checks the stamps (mtime, size, inode) on the listed directories, the index and the ignore files. A stamp less than 2 seconds old is never trusted, and the listing expires after 60 seconds.
+- **Faster new files.** When the file set has changed, git runs in parallel with hashing the previously listed files.
+
+Bench, on a 2,000-file repository:
+
+| Checkpoint after | p50 | p95 |
+|---|---|---|
+| Editing existing files | 25 ms (was 42) | 28 ms (was 85) |
+| Creating a file | 42 ms | 45–51 ms |
+
+- **Benchmark.** It now ages its fixture like a real checkout and reports new-file checkpoints separately.
+- **Opt out.** Set `GHF_NO_LISTING_CACHE=1` to always ask git.
+
 ## 0.1.0-rc.1 — 2026-10-15
 
 This is the first release candidate. It implements the full ghf MVP: capture, sync, restore and apply, and the trace lifecycle.

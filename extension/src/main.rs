@@ -7,6 +7,7 @@ mod config;
 mod error;
 mod git;
 mod hooks;
+mod listing;
 mod materialize;
 mod refs;
 mod remote;
