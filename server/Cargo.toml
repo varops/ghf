@@ -9,6 +9,14 @@ repository.workspace = true
 [dependencies]
 ghf-proto.workspace = true
 clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+rusqlite.workspace = true
+humantime.workspace = true
+axum.workspace = true
+axum-server.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

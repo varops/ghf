@@ -39,12 +39,18 @@ impl Response {
         }
     }
 
-    pub fn err(command: impl Into<String>, code: ErrorCode, message: impl Into<String>) -> Self {
+    /// Error response. `data` carries structured detail, such as apply conflicts.
+    pub fn err(
+        command: impl Into<String>,
+        code: ErrorCode,
+        message: impl Into<String>,
+        data: Option<serde_json::Value>,
+    ) -> Self {
         Self {
             schema: SCHEMA_VERSION.to_owned(),
             command: command.into(),
             ok: false,
-            data: None,
+            data,
             error: Some(ErrorBody {
                 code,
                 message: message.into(),
@@ -59,7 +65,7 @@ mod tests {
 
     #[test]
     fn error_round_trips() {
-        let resp = Response::err("sync", ErrorCode::NotSynced, "2 pending");
+        let resp = Response::err("sync", ErrorCode::NotSynced, "2 pending", None);
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("\"data\""));
         assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), resp);
