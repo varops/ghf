@@ -32,7 +32,6 @@ This is the first release candidate. It implements the full ghf MVP: capture, sy
   - `--json` envelope `ghf/v1`, stable error codes and exit codes, `--idempotency-key`, and no prompts in automation.
   - The full reference is in `docs/cli.md`.
 - **Agent skill:** `git hf skill install`.
-
 - **Safety.**
   - Manifests with unsafe entry names (`..`, `/`, `.git`, duplicates) are rejected by both client and server, so a restore can never write outside its worktree.
   - Restore and apply refuse, before changing anything, when an ignored, skipped or untracked file is in the way.
@@ -57,8 +56,8 @@ On a 2,000-file repository, release build:
 
 | Metric | Result |
 |---|---|
-| Checkpoint latency, p50 | 41 ms |
-| Checkpoint latency, p95 | 45 ms |
+| Checkpoint latency, p50 | 41–42 ms |
+| Checkpoint latency, p95 | 45 ms for single-file edits; 85 ms for the bench's multi-file pattern (target 50 ms) |
 | Sync of 200 checkpoints | 1.7 s |
 | Cross-machine restore | 0.6 s |
 

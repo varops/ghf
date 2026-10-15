@@ -124,11 +124,12 @@ Measured on a 2,000-file repository with 200 edits, release build, Apple Silicon
 
 | Metric | Result | PRD target |
 |---|---|---|
-| Checkpoint latency, one edit | p50 41 ms, p95 45 ms | p95 < 50 ms |
+| Checkpoint latency, single-file edits | p50 41 ms, p95 45 ms | p95 < 50 ms |
+| Checkpoint latency, bench pattern (1–3 files across directories) | p50 42 ms, p95 85 ms | p95 < 50 ms (**not met yet**) |
 | Sync of 200 checkpoints (1,721 objects, 0.6 MB) | 1.7 s | p95 < 5 s per sync |
 | Cross-machine restore | 0.6 s | p95 < 10 s |
 
-About half of capture time is `git ls-files`. Reproduce with:
+About half of capture time is `git ls-files`. The PRD treats these targets as proposals until M0 measures Cloop's real workloads. Reproduce with:
 
 ```bash
 cargo test --release -p git-hf --test bench -- --ignored --nocapture
