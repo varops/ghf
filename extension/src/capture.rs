@@ -69,8 +69,13 @@ pub fn check_writer(ws: &Workspace, trace: &TraceRow, writer: &str, takeover: bo
 }
 
 pub fn checkpoint(ws: &Workspace, req: &Request) -> Result<Outcome> {
+    let t = crate::timing::Timer::new();
     let _lock = lock(ws)?;
-    checkpoint_locked(ws, req)
+    t.mark("lock");
+    let out = checkpoint_locked(ws, req);
+    t.mark("capture total");
+    ws.store.maintain(64 * 1024 * 1024);
+    out
 }
 
 /// Serialize captures and restores within one worktree.
@@ -84,14 +89,27 @@ pub fn checkpoint_locked(ws: &Workspace, req: &Request) -> Result<Outcome> {
     if let Some(t) = &open {
         check_writer(ws, t, &req.writer, req.takeover)?;
     }
-    let snap = scan::scan(&ws.repo, &ws.store, &scan_options(ws, true)?)?;
-    record(ws, open, snap, req, None)
+    // New objects and the checkpoint record commit together.
+    ws.store.tx(|| {
+        let snap = scan::scan(&ws.repo, &ws.store, &scan_options(ws, true)?)?;
+        record(ws, open, snap, req, None)
+    })
 }
 
 /// Append a checkpoint for `snap` to the open trace (or a new one).
-/// `parent_override` links the first checkpoint of a new trace to the
-/// checkpoint it was forked from.
+/// `fork` links the first checkpoint of a new trace to the checkpoint it was
+/// forked from.
 pub fn record(
+    ws: &Workspace,
+    open: Option<TraceRow>,
+    snap: Snapshot,
+    req: &Request,
+    fork: Option<&CheckpointRecord>,
+) -> Result<Outcome> {
+    ws.store.tx(|| record_in_tx(ws, open, snap, req, fork))
+}
+
+fn record_in_tx(
     ws: &Workspace,
     open: Option<TraceRow>,
     snap: Snapshot,
@@ -119,7 +137,6 @@ pub fn record(
         });
     }
 
-    let tx = ws.store.db.unchecked_transaction()?;
     let (trace, trace_created) = match open {
         Some(t) => (t.record, false),
         None => {
@@ -169,7 +186,6 @@ pub fn record(
     };
     ws.store.insert_checkpoint(&ck, false)?;
     ws.store.set_writer(&trace.id, Some(&req.writer), now)?;
-    tx.commit()?;
     Ok(Outcome {
         checkpoint: ck,
         trace,

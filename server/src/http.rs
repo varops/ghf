@@ -57,6 +57,8 @@ fn bad(code: ErrorCode, msg: impl Into<String>) -> Error {
 pub fn router(state: Shared) -> Router {
     let repo = Router::new()
         .route("/objects/missing", post(missing))
+        .route("/objects/batch", post(put_batch))
+        .route("/objects/fetch", post(fetch_batch))
         .route("/objects/{id}", put(put_object).get(get_object))
         .route("/traces/{id}", put(put_trace).get(get_trace))
         .route(
@@ -146,14 +148,53 @@ async fn put_object(
     let repo = authorize(&s, &headers, &owner, &name)?;
     let id = object_id(&id)?;
     let s2 = s.clone();
-    // Verification and fsync happen off the async runtime.
+    // Verification and the database write happen off the async runtime.
     tokio::task::spawn_blocking(move || {
         let store = s2.store.lock().expect("store lock");
-        store.write_object(&repo, &id, &body)
+        store.write_objects(&repo, &[(id, &body[..])])
     })
     .await
     .map_err(|e| bad(ErrorCode::Internal, e.to_string()))??;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn put_batch(
+    State(s): State<Shared>,
+    Path((owner, name)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<StatusCode> {
+    let repo = authorize(&s, &headers, &owner, &name)?;
+    let s2 = s.clone();
+    tokio::task::spawn_blocking(move || {
+        let objects = ghf_proto::api::unframe(&body)
+            .ok_or_else(|| bad(ErrorCode::Usage, "malformed object batch"))?;
+        let store = s2.store.lock().expect("store lock");
+        store.write_objects(&repo, &objects)
+    })
+    .await
+    .map_err(|e| bad(ErrorCode::Internal, e.to_string()))??;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn fetch_batch(
+    State(s): State<Shared>,
+    Path((owner, name)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(req): Json<ObjectList>,
+) -> ApiResult<Response> {
+    let repo = authorize(&s, &headers, &owner, &name)?;
+    if req.ids.len() > 10_000 {
+        return Err(bad(ErrorCode::Usage, "at most 10000 ids per fetch"));
+    }
+    let store = s.store.lock().expect("store lock");
+    let mut body = Vec::new();
+    for id in &req.ids {
+        if let Some(d) = store.read_object(&repo, id)? {
+            ghf_proto::api::frame(&mut body, id, &d);
+        }
+    }
+    Ok(([("content-type", "application/octet-stream")], body).into_response())
 }
 
 async fn get_object(

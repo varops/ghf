@@ -84,11 +84,14 @@ fn mtime_ns(md: &fs::Metadata) -> i64 {
 
 pub fn scan(repo: &Repo, store: &Store, opts: &ScanOptions) -> Result<Snapshot> {
     let started_ns = ghf_proto::id::now_ms().saturating_mul(1_000_000);
+    let t = crate::timing::Timer::new();
     let (paths, mut skipped) = captured_paths(repo)?;
+    t.mark("list files");
     let cache = match &opts.context_id {
         Some(c) => store.load_statcache(c)?,
         None => HashMap::new(),
     };
+    t.mark("load stat cache");
     let mut upserts = Vec::new();
     let mut files = Manifest::new();
     let mut bytes = 0u64;
@@ -209,7 +212,9 @@ pub fn scan(repo: &Repo, store: &Store, opts: &ScanOptions) -> Result<Snapshot> 
         store.save_statcache(ctx, &upserts, &removed)?;
     }
 
+    t.mark("hash files");
     let root = build_tree(&files, opts.persist.then_some(store))?;
+    t.mark("build trees");
     Ok(Snapshot {
         root,
         files,

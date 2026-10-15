@@ -2,6 +2,7 @@
 //! `git worktree add` when restoring into a new worktree.
 
 use std::ffi::OsStr;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -40,12 +41,33 @@ fn run(mut cmd: Command) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
+fn is_sha(s: &str) -> bool {
+    matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn common_dir_of(git_dir: &Path) -> PathBuf {
+    match fs::read_to_string(git_dir.join("commondir")) {
+        Ok(t) => {
+            let p = git_dir.join(t.trim());
+            fs::canonicalize(&p).unwrap_or(p)
+        }
+        Err(_) => git_dir.to_path_buf(),
+    }
+}
+
 fn text(bytes: Vec<u8>) -> String {
     String::from_utf8_lossy(&bytes).trim_end().to_owned()
 }
 
 impl Repo {
     pub fn discover(cwd: &Path) -> Result<Self> {
+        // Hooks run on every edit; avoid spawning git when the layout is plain.
+        if std::env::var_os("GIT_DIR").is_none()
+            && std::env::var_os("GIT_WORK_TREE").is_none()
+            && let Some(r) = Self::discover_fast(cwd)
+        {
+            return Ok(r);
+        }
         let mut c = git_in(cwd);
         c.args([
             "rev-parse",
@@ -73,6 +95,46 @@ impl Repo {
         })
     }
 
+    /// Find `.git` by walking up from `cwd`. Handles linked worktrees and
+    /// submodules (`.git` files). Returns `None` for anything unusual so the
+    /// caller can ask git itself.
+    fn discover_fast(cwd: &Path) -> Option<Self> {
+        let start = fs::canonicalize(cwd).ok()?;
+        let mut dir = start.as_path();
+        loop {
+            let dotgit = dir.join(".git");
+            match fs::symlink_metadata(&dotgit) {
+                Ok(md) if md.is_dir() => {
+                    if !dotgit.join("HEAD").is_file() {
+                        return None;
+                    }
+                    let common = common_dir_of(&dotgit);
+                    return Some(Self {
+                        root: dir.to_path_buf(),
+                        git_dir: dotgit,
+                        common_dir: common,
+                    });
+                }
+                Ok(md) if md.is_file() => {
+                    let text = fs::read_to_string(&dotgit).ok()?;
+                    let p = Path::new(text.trim().strip_prefix("gitdir:")?.trim());
+                    let git_dir = fs::canonicalize(dir.join(p)).ok()?;
+                    if !git_dir.join("HEAD").is_file() {
+                        return None;
+                    }
+                    let common = common_dir_of(&git_dir);
+                    return Some(Self {
+                        root: dir.to_path_buf(),
+                        git_dir,
+                        common_dir: common,
+                    });
+                }
+                Ok(_) => return None,
+                Err(_) => dir = dir.parent()?,
+            }
+        }
+    }
+
     pub fn git(&self) -> Command {
         git_in(&self.root)
     }
@@ -89,7 +151,44 @@ impl Repo {
 
     /// Current HEAD commit, or `None` on an unborn branch.
     pub fn head(&self) -> Option<String> {
-        self.resolve_commit("HEAD")
+        match self.head_fast() {
+            Some(h) => h,
+            None => self.resolve_commit("HEAD"),
+        }
+    }
+
+    /// Read HEAD from loose or packed refs. `Some(None)` means unborn;
+    /// `None` means "ask git" (reftable, symbolic oddities).
+    fn head_fast(&self) -> Option<Option<String>> {
+        let head = fs::read_to_string(self.git_dir.join("HEAD")).ok()?;
+        let head = head.trim();
+        let Some(name) = head.strip_prefix("ref: ") else {
+            return is_sha(head).then(|| Some(head.to_owned()));
+        };
+        if self.common_dir.join("reftable").exists() {
+            return None;
+        }
+        for base in [&self.git_dir, &self.common_dir] {
+            if let Ok(s) = fs::read_to_string(base.join(name)) {
+                let s = s.trim();
+                return if is_sha(s) {
+                    Some(Some(s.to_owned()))
+                } else {
+                    None
+                };
+            }
+        }
+        if let Ok(packed) = fs::read_to_string(self.common_dir.join("packed-refs")) {
+            for line in packed.lines() {
+                if let Some((sha, n)) = line.split_once(' ')
+                    && n == name
+                    && is_sha(sha)
+                {
+                    return Some(Some(sha.to_owned()));
+                }
+            }
+        }
+        Some(None)
     }
 
     pub fn resolve_commit(&self, rev: &str) -> Option<String> {
@@ -214,7 +313,46 @@ pub fn repo_name_from_url(url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::repo_name_from_url;
+    use super::*;
+
+    #[test]
+    fn fast_paths_match_git() {
+        let dir = std::env::temp_dir().join(format!("ghf-git-{}", ghf_proto::id::random_hex(4)));
+        fs::create_dir_all(&dir).unwrap();
+        let g = |args: &[&str], d: &Path| {
+            assert!(
+                Command::new("git")
+                    .current_dir(d)
+                    .args(args)
+                    .env("GIT_AUTHOR_NAME", "t")
+                    .env("GIT_AUTHOR_EMAIL", "t@e")
+                    .env("GIT_COMMITTER_NAME", "t")
+                    .env("GIT_COMMITTER_EMAIL", "t@e")
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        g(&["init", "-q", "-b", "main"], &dir);
+        let r = Repo::discover(&dir).unwrap();
+        assert_eq!(r.head(), None, "unborn");
+        g(&["commit", "-q", "--allow-empty", "-m", "x"], &dir);
+        fs::create_dir_all(dir.join("sub/deep")).unwrap();
+        let fast = Repo::discover_fast(&dir.join("sub/deep")).unwrap();
+        assert_eq!(fast.head(), fast.resolve_commit("HEAD"));
+        g(&["pack-refs", "--all"], &dir);
+        assert_eq!(fast.head_fast(), Some(fast.resolve_commit("HEAD")));
+        let wt = dir.join("wt");
+        g(
+            &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()],
+            &dir,
+        );
+        let w = Repo::discover_fast(&wt).unwrap();
+        assert_eq!(w.common_dir, fs::canonicalize(dir.join(".git")).unwrap());
+        assert_ne!(w.git_dir, w.common_dir);
+        assert_eq!(w.head(), fast.head());
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn repo_names_from_urls() {

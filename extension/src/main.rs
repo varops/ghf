@@ -12,6 +12,7 @@ mod refs;
 mod remote;
 mod scan;
 mod store;
+mod timing;
 mod workspace;
 
 use std::process;

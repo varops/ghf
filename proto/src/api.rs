@@ -9,6 +9,8 @@
 //! | POST | `objects/missing` | [`ObjectList`] | [`ObjectList`] |
 //! | PUT | `objects/{id}` | zstd raw object | 204 |
 //! | GET | `objects/{id}` | | zstd raw object |
+//! | POST | `objects/batch` | [`frame`]d objects | 204 |
+//! | POST | `objects/fetch` | [`ObjectList`] | [`frame`]d objects (missing ones omitted) |
 //! | PUT | `traces/{id}` | [`TraceRecord`] | [`TraceRecord`] (merged) |
 //! | PUT | `checkpoints/{id}` | [`CheckpointRecord`] | 204 |
 //! | PUT | `traces/{id}/holds/{name}` | [`HoldRequest`] | [`TraceRecord`] |
@@ -89,6 +91,33 @@ pub struct KeptTrace {
     pub eligible_at: Option<i64>,
 }
 
+/// Append one object to a batch body: 32-byte id, 8-byte big-endian length,
+/// then the zstd-compressed raw object.
+pub fn frame(out: &mut Vec<u8>, id: &ObjectId, data: &[u8]) {
+    out.extend_from_slice(&id.0);
+    out.extend_from_slice(&(data.len() as u64).to_be_bytes());
+    out.extend_from_slice(data);
+}
+
+/// Split a batch body into objects. `None` if the body is malformed.
+pub fn unframe(mut buf: &[u8]) -> Option<Vec<(ObjectId, &[u8])>> {
+    let mut out = Vec::new();
+    while !buf.is_empty() {
+        if buf.len() < 40 {
+            return None;
+        }
+        let id = ObjectId(buf[..32].try_into().ok()?);
+        let len = u64::from_be_bytes(buf[32..40].try_into().ok()?) as usize;
+        let rest = &buf[40..];
+        if rest.len() < len {
+            return None;
+        }
+        out.push((id, &rest[..len]));
+        buf = &rest[len..];
+    }
+    Some(out)
+}
+
 /// Validate an `owner/name` repository identifier.
 pub fn valid_repo(repo: &str) -> bool {
     let ok = |s: &str| {
@@ -103,6 +132,19 @@ pub fn valid_repo(repo: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn frames_round_trip() {
+        let a = crate::object::hash(crate::object::Kind::Blob, b"a");
+        let b = crate::object::hash(crate::object::Kind::Blob, b"b");
+        let mut buf = Vec::new();
+        super::frame(&mut buf, &a, b"one");
+        super::frame(&mut buf, &b, b"");
+        let v = super::unframe(&buf).unwrap();
+        assert_eq!(v, vec![(a, &b"one"[..]), (b, &b""[..])]);
+        assert!(super::unframe(&buf[..buf.len() - 1]).is_none());
+        assert!(super::unframe(&buf[..20]).is_none());
+    }
+
     #[test]
     fn repo_names() {
         assert!(super::valid_repo("org/project"));

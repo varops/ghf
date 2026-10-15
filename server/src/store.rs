@@ -1,8 +1,8 @@
 //! Server storage: SQLite metadata plus per-repository content-addressed
 //! object directories under the data dir.
 
+use std::collections::HashSet;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use ghf_proto::object::{self, Mode};
@@ -83,6 +83,13 @@ CREATE TABLE IF NOT EXISTS pending (
     reported_at INTEGER NOT NULL,
     PRIMARY KEY (repo, client)
 );
+CREATE TABLE IF NOT EXISTS objects (
+    repo TEXT NOT NULL,
+    id BLOB NOT NULL,
+    data BLOB NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (repo, id)
+);
 CREATE TABLE IF NOT EXISTS counter (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     seq INTEGER NOT NULL
@@ -101,8 +108,7 @@ pub fn hash_token(token: &str) -> String {
 
 impl Store {
     pub fn open(dir: &Path) -> DbResult<Self> {
-        fs::create_dir_all(dir.join("objects"))?;
-        fs::create_dir_all(dir.join("tmp"))?;
+        fs::create_dir_all(dir)?;
         let db = Connection::open(dir.join("server.db"))?;
         db.busy_timeout(std::time::Duration::from_secs(30))?;
         db.pragma_update(None, "journal_mode", "WAL")?;
@@ -214,47 +220,51 @@ impl Store {
 
     // -- objects ----------------------------------------------------------------
 
-    fn object_path(&self, repo: &str, id: &ObjectId) -> PathBuf {
-        let hex = id.to_hex();
-        self.dir
-            .join("objects")
-            .join(repo)
-            .join(&hex[..2])
-            .join(&hex[2..])
-    }
-
     pub fn has_object(&self, repo: &str, id: &ObjectId) -> bool {
-        self.object_path(repo, id).exists()
+        self.db
+            .query_row(
+                "SELECT 1 FROM objects WHERE repo = ?1 AND id = ?2",
+                params![repo, &id.0[..]],
+                |_| Ok(()),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .is_some()
     }
 
     pub fn read_object(&self, repo: &str, id: &ObjectId) -> DbResult<Option<Vec<u8>>> {
-        match fs::read(self.object_path(repo, id)) {
-            Ok(d) => Ok(Some(d)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        Ok(self
+            .db
+            .query_row(
+                "SELECT data FROM objects WHERE repo = ?1 AND id = ?2",
+                params![repo, &id.0[..]],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
-    pub fn write_object(&self, repo: &str, id: &ObjectId, data: &[u8]) -> DbResult<()> {
-        if self.has_object(repo, id) {
-            return Ok(());
+    /// Verify and store objects in one transaction.
+    pub fn write_objects(&self, repo: &str, objects: &[(ObjectId, &[u8])]) -> DbResult<()> {
+        for (id, data) in objects {
+            if object::verify(id, data).is_none() {
+                return Err(Error::new(
+                    ghf_proto::ErrorCode::Usage,
+                    format!("object {} does not match its content", id.short()),
+                ));
+            }
         }
-        if object::verify(id, data).is_none() {
-            return Err(Error::new(
-                ghf_proto::ErrorCode::Usage,
-                format!("object {} does not match its content", id.short()),
-            ));
+        let tx = self.db.unchecked_transaction()?;
+        {
+            let mut st = tx.prepare(
+                "INSERT OR IGNORE INTO objects (repo, id, data, created_at) VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            let now = ghf_proto::id::now_ms();
+            for (id, data) in objects {
+                st.execute(params![repo, &id.0[..], data, now])?;
+            }
         }
-        let path = self.object_path(repo, id);
-        fs::create_dir_all(path.parent().expect("parent"))?;
-        let tmp = self
-            .dir
-            .join("tmp")
-            .join(format!("obj-{}", ghf_proto::id::random_hex(8)));
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(data)?;
-        f.sync_all()?;
-        fs::rename(&tmp, &path)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -278,7 +288,7 @@ impl Store {
     /// First missing object in the closure of `root`, if any.
     pub fn missing_in_closure(&self, repo: &str, root: &ObjectId) -> DbResult<Option<ObjectId>> {
         let mut stack = vec![*root];
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         while let Some(id) = stack.pop() {
             if !seen.insert(id) {
                 continue;
@@ -298,12 +308,7 @@ impl Store {
     }
 
     /// Mark every object reachable from `root`.
-    pub fn mark(
-        &self,
-        repo: &str,
-        root: &ObjectId,
-        live: &mut std::collections::HashSet<ObjectId>,
-    ) -> DbResult<()> {
+    pub fn mark(&self, repo: &str, root: &ObjectId, live: &mut HashSet<ObjectId>) -> DbResult<()> {
         let mut stack = vec![*root];
         while let Some(id) = stack.pop() {
             if !live.insert(id) {
@@ -326,42 +331,37 @@ impl Store {
     pub fn sweep(
         &self,
         repo: &str,
-        live: &std::collections::HashSet<ObjectId>,
+        live: &HashSet<ObjectId>,
         grace: std::time::Duration,
         dry_run: bool,
     ) -> DbResult<(u64, u64)> {
-        let base = self.dir.join("objects").join(repo);
-        let cutoff = std::time::SystemTime::now() - grace;
-        let (mut n, mut bytes) = (0, 0);
-        let Ok(dirs) = fs::read_dir(&base) else {
-            return Ok((0, 0));
+        let cutoff = ghf_proto::id::now_ms() - grace.as_millis() as i64;
+        let candidates: Vec<(Vec<u8>, i64)> = {
+            let mut st = self.db.prepare(
+                "SELECT id, length(data) FROM objects WHERE repo = ?1 AND created_at <= ?2",
+            )?;
+            let rows = st.query_map(params![repo, cutoff], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
         };
-        for d in dirs {
-            let d = d?;
-            if !d.file_type()?.is_dir() {
+        let (mut n, mut bytes) = (0, 0);
+        let tx = self.db.unchecked_transaction()?;
+        for (id, len) in candidates {
+            let Ok(arr) = <[u8; 32]>::try_from(id.as_slice()) else {
+                continue;
+            };
+            if live.contains(&ObjectId(arr)) {
                 continue;
             }
-            let prefix = d.file_name().to_string_lossy().into_owned();
-            for f in fs::read_dir(d.path())? {
-                let f = f?;
-                let name = f.file_name().to_string_lossy().into_owned();
-                let Some(id) = ObjectId::from_hex(&format!("{prefix}{name}")) else {
-                    continue;
-                };
-                if live.contains(&id) {
-                    continue;
-                }
-                let md = f.metadata()?;
-                if md.modified().is_ok_and(|m| m > cutoff) {
-                    continue;
-                }
-                if !dry_run {
-                    fs::remove_file(f.path())?;
-                }
-                n += 1;
-                bytes += md.len();
+            if !dry_run {
+                tx.execute(
+                    "DELETE FROM objects WHERE repo = ?1 AND id = ?2",
+                    params![repo, id],
+                )?;
             }
+            n += 1;
+            bytes += len as u64;
         }
+        tx.commit()?;
         Ok((n, bytes))
     }
 
@@ -560,12 +560,12 @@ impl Store {
         Ok(())
     }
 
-    pub fn pending_traces(&self, repo: &str) -> DbResult<std::collections::HashSet<String>> {
+    pub fn pending_traces(&self, repo: &str) -> DbResult<HashSet<String>> {
         let mut st = self
             .db
             .prepare("SELECT traces FROM pending WHERE repo = ?1")?;
         let rows = st.query_map([repo], |r| r.get::<_, String>(0))?;
-        let mut out = std::collections::HashSet::new();
+        let mut out = HashSet::new();
         for r in rows {
             let v: Vec<String> = serde_json::from_str(&r?)?;
             out.extend(v);

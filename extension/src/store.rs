@@ -1,10 +1,12 @@
-//! Local durable buffer: SQLite metadata plus a content-addressed object
-//! directory, shared by all worktrees of a repository under
+//! Local durable buffer: one SQLite database holding metadata and
+//! content-addressed objects, shared by all worktrees of a repository under
 //! `<git-common-dir>/ghf/`. Nothing here is a Git ref or Git object.
+//!
+//! A checkpoint's new objects and its record commit in one transaction, so a
+//! crash leaves either the whole checkpoint or none of it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use ghf_proto::object::{self, Kind, TreeEntry};
@@ -67,6 +69,14 @@ CREATE TABLE IF NOT EXISTS idempotency (
     response TEXT NOT NULL,
     at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS objects (
+    id BLOB PRIMARY KEY,
+    data BLOB NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS remote_objects (
+    id BLOB PRIMARY KEY
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -118,32 +128,66 @@ fn parse_mode(s: &str) -> object::Mode {
 impl Store {
     pub fn open(common_dir: &Path) -> Result<Self> {
         let dir = common_dir.join("ghf");
-        fs::create_dir_all(dir.join("objects")).context(|| format!("create {}", dir.display()))?;
-        fs::create_dir_all(dir.join("tmp"))?;
+        fs::create_dir_all(dir.join("tmp")).context(|| format!("create {}", dir.display()))?;
         let db = Connection::open(dir.join("ghf.db"))?;
         db.busy_timeout(std::time::Duration::from_secs(30))?;
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "FULL")?;
+        // WAL checkpoints are moved off the capture path; see `maintain`.
+        db.pragma_update(None, "wal_autocheckpoint", 0)?;
         db.execute_batch(SCHEMA)?;
         Ok(Self { db, dir })
+    }
+
+    /// Fold the write-ahead log back into the database once it grows past
+    /// `threshold` bytes. Captures pass a high threshold so they rarely pay
+    /// for this; other commands and background sync pass a low one.
+    pub fn maintain(&self, threshold: u64) {
+        let wal = fs::metadata(self.dir.join("ghf.db-wal")).map_or(0, |m| m.len());
+        if wal > threshold {
+            let _ = self
+                .db
+                .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()));
+        }
     }
 
     pub fn tmp_dir(&self) -> PathBuf {
         self.dir.join("tmp")
     }
 
+    /// Run `f` in one write transaction (re-entrant: nested calls join the
+    /// outer transaction). Commits on `Ok`, rolls back on `Err`.
+    pub fn tx<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        if !self.db.is_autocommit() {
+            return f();
+        }
+        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        match f() {
+            Ok(v) => {
+                self.db.execute_batch("COMMIT")?;
+                Ok(v)
+            }
+            Err(e) => {
+                let _ = self.db.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
     // -- objects ------------------------------------------------------------
 
-    fn object_path(&self, id: &ObjectId) -> PathBuf {
-        let hex = id.to_hex();
-        self.dir.join("objects").join(&hex[..2]).join(&hex[2..])
-    }
-
     pub fn has_object(&self, id: &ObjectId) -> bool {
-        self.object_path(id).exists()
+        self.db
+            .query_row("SELECT 1 FROM objects WHERE id = ?1", [&id.0[..]], |_| {
+                Ok(())
+            })
+            .optional()
+            .ok()
+            .flatten()
+            .is_some()
     }
 
-    /// Store an object; returns its id. Durable before returning.
+    /// Store an object; returns its id.
     pub fn put(&self, kind: Kind, body: &[u8]) -> Result<ObjectId> {
         let id = object::hash(kind, body);
         if !self.has_object(&id) {
@@ -165,25 +209,20 @@ impl Store {
     }
 
     fn write_object(&self, id: &ObjectId, data: &[u8]) -> Result<()> {
-        let path = self.object_path(id);
-        let parent = path.parent().expect("object dir");
-        fs::create_dir_all(parent)?;
-        let tmp = self
-            .tmp_dir()
-            .join(format!("obj-{}", ghf_proto::id::random_hex(8)));
-        let mut f = fs::File::create(&tmp).context(|| format!("write {}", tmp.display()))?;
-        f.write_all(data)?;
-        f.sync_all()?;
-        fs::rename(&tmp, &path).context(|| format!("store object {}", id.short()))?;
+        self.db.execute(
+            "INSERT OR IGNORE INTO objects (id, data, created_at) VALUES (?1, ?2, ?3)",
+            params![&id.0[..], data, ghf_proto::id::now_ms()],
+        )?;
         Ok(())
     }
 
     pub fn get_compressed(&self, id: &ObjectId) -> Result<Option<Vec<u8>>> {
-        match fs::read(self.object_path(id)) {
-            Ok(d) => Ok(Some(d)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        Ok(self
+            .db
+            .query_row("SELECT data FROM objects WHERE id = ?1", [&id.0[..]], |r| {
+                r.get(0)
+            })
+            .optional()?)
     }
 
     pub fn get(&self, id: &ObjectId) -> Result<Option<(Kind, Vec<u8>)>> {
@@ -215,30 +254,66 @@ impl Store {
         }
     }
 
-    pub fn delete_object(&self, id: &ObjectId) -> Result<()> {
-        match fs::remove_file(self.object_path(id)) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
-            _ => Ok(()),
-        }
+    /// Delete objects not in `live` and older than `grace_ms`.
+    /// Returns (count, bytes).
+    pub fn sweep(&self, live: &HashSet<ObjectId>, grace_ms: i64) -> Result<(u64, u64)> {
+        let cutoff = ghf_proto::id::now_ms() - grace_ms;
+        let candidates: Vec<(Vec<u8>, i64)> = {
+            let mut st = self
+                .db
+                .prepare("SELECT id, length(data) FROM objects WHERE created_at <= ?1")?;
+            let rows = st.query_map([cutoff], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let (mut n, mut bytes) = (0, 0);
+        self.tx(|| {
+            for (id, len) in &candidates {
+                let Ok(arr) = <[u8; 32]>::try_from(id.as_slice()) else {
+                    continue;
+                };
+                if live.contains(&ObjectId(arr)) {
+                    continue;
+                }
+                self.db.execute("DELETE FROM objects WHERE id = ?1", [id])?;
+                self.db
+                    .execute("DELETE FROM remote_objects WHERE id = ?1", [id])?;
+                n += 1;
+                bytes += *len as u64;
+            }
+            Ok(())
+        })?;
+        Ok((n, bytes))
     }
 
-    /// Every object id in the store.
-    pub fn all_objects(&self) -> Result<Vec<ObjectId>> {
-        let mut out = Vec::new();
-        for d in fs::read_dir(self.dir.join("objects"))? {
-            let d = d?;
-            let prefix = d.file_name().to_string_lossy().into_owned();
-            if !d.file_type()?.is_dir() {
-                continue;
+    /// Objects the server is known to hold (with their full closure).
+    pub fn remote_has(&self, id: &ObjectId) -> bool {
+        self.db
+            .query_row(
+                "SELECT 1 FROM remote_objects WHERE id = ?1",
+                [&id.0[..]],
+                |_| Ok(()),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    pub fn mark_remote(&self, ids: &[ObjectId]) -> Result<()> {
+        self.tx(|| {
+            let mut st = self
+                .db
+                .prepare("INSERT OR IGNORE INTO remote_objects (id) VALUES (?1)")?;
+            for id in ids {
+                st.execute([&id.0[..]])?;
             }
-            for f in fs::read_dir(d.path())? {
-                let name = f?.file_name().to_string_lossy().into_owned();
-                if let Some(id) = ObjectId::from_hex(&format!("{prefix}{name}")) {
-                    out.push(id);
-                }
-            }
-        }
-        Ok(out)
+            Ok(())
+        })
+    }
+
+    pub fn forget_remote(&self) -> Result<()> {
+        self.db.execute("DELETE FROM remote_objects", [])?;
+        Ok(())
     }
 
     // -- traces ---------------------------------------------------------------
@@ -355,18 +430,19 @@ impl Store {
     }
 
     pub fn delete_trace_rows(&self, trace_id: &str, keep: &[String]) -> Result<()> {
-        let tx = self.db.unchecked_transaction()?;
-        {
-            let mut st = tx.prepare("SELECT id FROM checkpoints WHERE trace_id = ?1")?;
+        self.tx(|| {
+            let mut st = self
+                .db
+                .prepare("SELECT id FROM checkpoints WHERE trace_id = ?1")?;
             let ids: Vec<String> = st
                 .query_map([trace_id], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?;
             for id in ids.iter().filter(|i| !keep.contains(i)) {
-                tx.execute("DELETE FROM checkpoints WHERE id = ?1", [id])?;
+                self.db
+                    .execute("DELETE FROM checkpoints WHERE id = ?1", [id])?;
             }
-        }
-        tx.commit()?;
-        Ok(())
+            Ok(())
+        })
     }
 
     // -- checkpoints ----------------------------------------------------------
@@ -581,9 +657,8 @@ impl Store {
         if upserts.is_empty() && removed.is_empty() {
             return Ok(());
         }
-        let tx = self.db.unchecked_transaction()?;
-        {
-            let mut up = tx.prepare(
+        self.tx(|| {
+            let mut up = self.db.prepare(
                 "INSERT OR REPLACE INTO statcache (context_id, path, size, mtime, ino, mode, id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             for (path, e) in upserts {
@@ -597,14 +672,14 @@ impl Store {
                     e.id.to_hex()
                 ])?;
             }
-            let mut del =
-                tx.prepare("DELETE FROM statcache WHERE context_id = ?1 AND path = ?2")?;
+            let mut del = self
+                .db
+                .prepare("DELETE FROM statcache WHERE context_id = ?1 AND path = ?2")?;
             for path in removed {
                 del.execute(params![context_id, path])?;
             }
-        }
-        tx.commit()?;
-        Ok(())
+            Ok(())
+        })
     }
 
     // -- idempotency and kv ------------------------------------------------------------

@@ -45,8 +45,11 @@ impl Env {
         remote::interactive(self.json)
     }
 
+    /// Open the workspace. Non-capture commands also tidy the local store.
     fn ws(&self) -> Result<Workspace> {
-        Workspace::open(&self.cwd)
+        let ws = Workspace::open(&self.cwd)?;
+        ws.store.maintain(4 * 1024 * 1024);
+        Ok(ws)
     }
 }
 
@@ -379,7 +382,7 @@ pub fn checkpoint(env: &Env, a: CheckpointArgs) -> Result<Out> {
         force: a.force,
     };
     let repo = Repo::discover(&env.cwd)?;
-    let ws = match env.ws() {
+    let ws = match Workspace::open(&env.cwd) {
         Ok(ws) => ws,
         Err(f) => {
             capture::note_failure(None, Some(&repo.git_dir), &f, false);
@@ -762,29 +765,33 @@ fn restore_new_worktree(
     let stats =
         materialize::materialize(&new_ws.repo.root, &new_ws.store, &target, &current.files)?;
     let _lock = capture::lock(&new_ws)?;
-    let snap = scan::scan(
-        &new_ws.repo,
-        &new_ws.store,
-        &capture::scan_options(&new_ws, true)?,
-    )?;
-    if snap.root != ck.root {
-        fail!(
-            Internal,
-            "restored worktree does not match checkpoint {} (got {})",
-            ck.id,
-            snap.root.short()
-        );
-    }
-    let req = Request {
-        message: Some(format!("restored from {}", ck.id)),
-        annotations: BTreeMap::from([("restored_from".into(), ck.id.clone())]),
-        writer: workspace::default_writer(),
-        force: true,
-        ..Default::default()
-    };
-    let o = capture::record(&new_ws, None, snap, &req, Some(ck))?;
-    // The new trace is unclaimed until its first writer checkpoints.
-    new_ws.store.set_writer(&o.trace.id, None, 0)?;
+    // Content, verification and the new trace commit together.
+    let o = new_ws.store.tx(|| {
+        let snap = scan::scan(
+            &new_ws.repo,
+            &new_ws.store,
+            &capture::scan_options(&new_ws, true)?,
+        )?;
+        if snap.root != ck.root {
+            fail!(
+                Internal,
+                "restored worktree does not match checkpoint {} (got {})",
+                ck.id,
+                snap.root.short()
+            );
+        }
+        let req = Request {
+            message: Some(format!("restored from {}", ck.id)),
+            annotations: BTreeMap::from([("restored_from".into(), ck.id.clone())]),
+            writer: workspace::default_writer(),
+            force: true,
+            ..Default::default()
+        };
+        let o = capture::record(&new_ws, None, snap, &req, Some(ck))?;
+        // The new trace is unclaimed until its first writer checkpoints.
+        new_ws.store.set_writer(&o.trace.id, None, 0)?;
+        Ok(o)
+    })?;
     remote::spawn_background(&new_ws);
     let mut human = format!(
         "restored {} into {}\nnew trace {} (context {})",
@@ -934,6 +941,9 @@ pub fn trace_apply(env: &Env, range: String, write_conflicts: bool) -> Result<Ou
         capture::check_writer(&ws, t, &writer, false)?;
     }
     let deltas = scan::diff_trees(&ws.store, Some(&a.root), Some(&b.root))?;
+    // One transaction from the scan through the pre-apply checkpoint. An
+    // early error return leaves it open; the process exit rolls it back.
+    ws.store.db.execute_batch("BEGIN IMMEDIATE")?;
     let current = scan::scan(&ws.repo, &ws.store, &capture::scan_options(&ws, true)?)?;
     let mut target = current.files.clone();
     let mut conflicts = Vec::new();
@@ -1043,6 +1053,8 @@ pub fn trace_apply(env: &Env, range: String, write_conflicts: bool) -> Result<Ou
         };
         pre = Some(capture::checkpoint_locked(&ws, &req)?.checkpoint.id);
     }
+    // The pre-apply checkpoint is durable before the tree changes.
+    ws.store.db.execute_batch("COMMIT")?;
     let stats = materialize::materialize(&ws.repo.root, &ws.store, &target, &current.files)?;
     let req = Request {
         message: Some(format!("applied {}..{}", a.id, b.id)),
@@ -1320,52 +1332,29 @@ fn prune_local(ws: &Workspace, dry_run: bool, has_server: bool) -> Result<Value>
 }
 
 /// Delete objects no remaining checkpoint references. Objects younger than
-/// an hour are kept: a capture may be writing them right now.
+/// the grace period (default one hour, `GHF_GC_GRACE`) are kept: a capture
+/// may be writing them right now.
 fn gc(ws: &Workspace) -> Result<(u64, u64)> {
     let mut live = std::collections::HashSet::new();
-    fn mark(
-        ws: &Workspace,
-        id: &ghf_proto::ObjectId,
-        live: &mut std::collections::HashSet<ghf_proto::ObjectId>,
-    ) -> Result<()> {
-        if !live.insert(*id) {
-            return Ok(());
+    let mut stack: Vec<ghf_proto::ObjectId> =
+        ws.store.all_checkpoints()?.iter().map(|c| c.root).collect();
+    while let Some(id) = stack.pop() {
+        if !live.insert(id) {
+            continue;
         }
-        if let Ok(entries) = ws.store.tree(id) {
+        if let Ok(entries) = ws.store.tree(&id) {
             for e in entries {
                 if e.mode == Mode::Tree {
-                    mark(ws, &e.id, live)?;
+                    stack.push(e.id);
                 } else {
                     live.insert(e.id);
                 }
             }
         }
-        Ok(())
-    }
-    for c in ws.store.all_checkpoints()? {
-        mark(ws, &c.root, &mut live)?;
     }
     let grace = std::env::var("GHF_GC_GRACE")
         .ok()
         .and_then(|s| retention::parse_duration_ms(&s))
         .unwrap_or(3_600_000);
-    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_millis(grace as u64);
-    let (mut n, mut bytes) = (0, 0);
-    for id in ws.store.all_objects()? {
-        if live.contains(&id) {
-            continue;
-        }
-        let hex = id.to_hex();
-        let path = ws.store.dir.join("objects").join(&hex[..2]).join(&hex[2..]);
-        let Ok(md) = fs::metadata(&path) else {
-            continue;
-        };
-        if md.modified().is_ok_and(|m| m > cutoff) {
-            continue;
-        }
-        ws.store.delete_object(&id)?;
-        n += 1;
-        bytes += md.len();
-    }
-    Ok((n, bytes))
+    ws.store.sweep(&live, grace)
 }

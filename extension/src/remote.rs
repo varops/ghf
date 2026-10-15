@@ -8,7 +8,7 @@ use ghf_proto::api::{
     ApiError, Changes, HoldRequest, ObjectList, PendingReport, PruneReport, PruneRequest,
     ServerInfo,
 };
-use ghf_proto::object::{Kind, Mode};
+use ghf_proto::object::Mode;
 use ghf_proto::{CheckpointRecord, ErrorCode, ObjectId, Policy, TraceRecord};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -217,32 +217,38 @@ impl Remote {
         Ok(out)
     }
 
-    pub fn put_object(&self, id: &ObjectId, data: &[u8]) -> Result<()> {
+    /// Upload framed objects in one request.
+    pub fn put_batch(&self, body: Vec<u8>) -> Result<()> {
         self.verify()?;
         let resp = self
             .agent
-            .put(self.endpoint(&format!("objects/{id}")))
+            .post(self.endpoint("objects/batch"))
             .header("Authorization", self.auth()?)
             .header("Content-Type", "application/octet-stream")
-            .send(data)
+            .send(&body[..])
             .map_err(|e| self.net(e))?;
         self.check(resp).map(|_| ())
     }
 
-    pub fn get_object(&self, id: &ObjectId) -> Result<Vec<u8>> {
+    /// Download objects; ids the server lacks are omitted.
+    pub fn fetch_batch(&self, ids: &[ObjectId]) -> Result<Vec<(ObjectId, Vec<u8>)>> {
         self.verify()?;
         let resp = self
             .agent
-            .get(self.endpoint(&format!("objects/{id}")))
+            .post(self.endpoint("objects/fetch"))
             .header("Authorization", self.auth()?)
-            .call()
+            .send_json(&ObjectList { ids: ids.to_vec() })
             .map_err(|e| self.net(e))?;
         let mut resp = self.check(resp)?;
-        resp.body_mut()
+        let body = resp
+            .body_mut()
             .with_config()
             .limit(u64::MAX)
             .read_to_vec()
-            .map_err(|e| err!(Server, "download object {}: {e}", id.short()))
+            .map_err(|e| err!(Server, "download objects: {e}"))?;
+        let frames = ghf_proto::api::unframe(&body)
+            .ok_or_else(|| err!(Server, "malformed object batch from server"))?;
+        Ok(frames.into_iter().map(|(id, d)| (id, d.to_vec())).collect())
     }
 
     pub fn put_trace(&self, t: &TraceRecord) -> Result<TraceRecord> {
@@ -324,63 +330,72 @@ fn pending_traces(ws: &Workspace) -> Result<Vec<String>> {
     Ok(ids)
 }
 
-/// Upload the closure of `root` that the server lacks, children first, so a
-/// tree present on the server always has its content present too.
+/// Upper bound for one upload request body.
+const BATCH_BYTES: usize = 8 * 1024 * 1024;
+
+/// Objects in the closure of `root` not known to be on the server, children
+/// before parents.
+fn closure_order(ws: &Workspace, root: &ObjectId, trust_cache: bool) -> Result<Vec<ObjectId>> {
+    let mut order = Vec::new();
+    let mut seen = HashSet::new();
+    fn walk(
+        ws: &Workspace,
+        id: &ObjectId,
+        trust_cache: bool,
+        seen: &mut HashSet<ObjectId>,
+        order: &mut Vec<ObjectId>,
+    ) -> Result<()> {
+        if !seen.insert(*id) || (trust_cache && ws.store.remote_has(id)) {
+            return Ok(());
+        }
+        for e in ws.store.tree(id)? {
+            if e.mode == Mode::Tree {
+                walk(ws, &e.id, trust_cache, seen, order)?;
+            } else if !(trust_cache && ws.store.remote_has(&e.id)) && seen.insert(e.id) {
+                order.push(e.id);
+            }
+        }
+        order.push(*id);
+        Ok(())
+    }
+    walk(ws, root, trust_cache, &mut seen, &mut order)?;
+    Ok(order)
+}
+
+/// Upload whatever part of `root`'s closure the server lacks, in batches,
+/// children before parents.
 fn upload_closure(
     ws: &Workspace,
     remote: &Remote,
     root: &ObjectId,
+    trust_cache: bool,
     report: &mut SyncReport,
-) -> Result<()> {
-    if remote.missing(&[*root])?.is_empty() {
-        return Ok(());
+) -> Result<Vec<ObjectId>> {
+    let order = closure_order(ws, root, trust_cache)?;
+    if order.is_empty() {
+        return Ok(order);
     }
-    let mut seen = HashSet::new();
-    upload_tree(ws, remote, root, &mut seen, report)
-}
-
-fn upload_tree(
-    ws: &Workspace,
-    remote: &Remote,
-    id: &ObjectId,
-    seen: &mut HashSet<ObjectId>,
-    report: &mut SyncReport,
-) -> Result<()> {
-    let entries = ws.store.tree(id)?;
-    let mut ids: Vec<ObjectId> = entries.iter().map(|e| e.id).collect();
-    ids.sort();
-    ids.dedup();
-    let missing: HashSet<ObjectId> = remote.missing(&ids)?.into_iter().collect();
-    for e in &entries {
-        if !missing.contains(&e.id) || !seen.insert(e.id) {
-            continue;
-        }
-        if e.mode == Mode::Tree {
-            upload_tree(ws, remote, &e.id, seen, report)?;
-        } else {
-            upload_object(ws, remote, &e.id, report)?;
+    let missing: HashSet<ObjectId> = remote.missing(&order)?.into_iter().collect();
+    let mut body = Vec::new();
+    for id in order.iter().filter(|id| missing.contains(id)) {
+        let data = ws.store.get_compressed(id)?.ok_or_else(|| {
+            err!(
+                ObjectMissing,
+                "object {} missing from local store",
+                id.short()
+            )
+        })?;
+        ghf_proto::api::frame(&mut body, id, &data);
+        report.pushed_objects += 1;
+        report.pushed_bytes += data.len() as u64;
+        if body.len() >= BATCH_BYTES {
+            remote.put_batch(std::mem::take(&mut body))?;
         }
     }
-    upload_object(ws, remote, id, report)
-}
-
-fn upload_object(
-    ws: &Workspace,
-    remote: &Remote,
-    id: &ObjectId,
-    report: &mut SyncReport,
-) -> Result<()> {
-    let data = ws.store.get_compressed(id)?.ok_or_else(|| {
-        err!(
-            ObjectMissing,
-            "object {} missing from local store",
-            id.short()
-        )
-    })?;
-    remote.put_object(id, &data)?;
-    report.pushed_objects += 1;
-    report.pushed_bytes += data.len() as u64;
-    Ok(())
+    if !body.is_empty() {
+        remote.put_batch(body)?;
+    }
+    Ok(order)
 }
 
 /// Push everything pending, then pull remote metadata.
@@ -396,17 +411,22 @@ pub fn sync(ws: &Workspace, remote: &Remote) -> Result<SyncReport> {
     }
 
     for ck in ws.store.unsynced()? {
-        upload_closure(ws, remote, &ck.root, &mut report)?;
+        let mut sent = upload_closure(ws, remote, &ck.root, true, &mut report)?;
         match remote.put_checkpoint(&ck) {
             Err(f) if f.code == ErrorCode::ObjectMissing => {
-                // The server lost part of a closure; upload it all.
-                let mut seen = HashSet::new();
-                upload_tree(ws, remote, &ck.root, &mut seen, &mut report)?;
+                // The server lost objects we thought it had (pruned); stop
+                // trusting the cache and check the whole closure.
+                ws.store.forget_remote()?;
+                sent = upload_closure(ws, remote, &ck.root, false, &mut report)?;
                 remote.put_checkpoint(&ck)?;
             }
             r => r?,
         }
-        ws.store.mark_synced(&ck.id)?;
+        // The server verified the closure: remember it to skip next time.
+        ws.store.tx(|| {
+            ws.store.mark_remote(&sent)?;
+            ws.store.mark_synced(&ck.id)
+        })?;
         report.pushed_checkpoints += 1;
     }
 
@@ -442,32 +462,33 @@ pub fn pull(ws: &Workspace, remote: &Remote, report: &mut SyncReport) -> Result<
         .unwrap_or(0);
     loop {
         let ch = remote.changes(since)?;
-        let tx = ws.store.db.unchecked_transaction()?;
-        for t in &ch.traces {
-            match ws.store.trace(&t.id)? {
-                None => {
-                    ws.store.insert_trace(t, false)?;
-                }
-                Some(_) => {
-                    // Local edits not yet pushed win; the next push merges them.
-                    let dirty: i64 = ws.store.db.query_row(
-                        "SELECT dirty FROM traces WHERE id = ?1",
-                        [&t.id],
-                        |r| r.get(0),
-                    )?;
-                    if dirty == 0 {
-                        ws.store.update_trace(t, false)?;
+        ws.store.tx(|| {
+            for t in &ch.traces {
+                match ws.store.trace(&t.id)? {
+                    None => {
+                        ws.store.insert_trace(t, false)?;
+                    }
+                    Some(_) => {
+                        // Local edits not yet pushed win; the next push merges them.
+                        let dirty: i64 = ws.store.db.query_row(
+                            "SELECT dirty FROM traces WHERE id = ?1",
+                            [&t.id],
+                            |r| r.get(0),
+                        )?;
+                        if dirty == 0 {
+                            ws.store.update_trace(t, false)?;
+                        }
                     }
                 }
+                report.pulled_traces += 1;
             }
-            report.pulled_traces += 1;
-        }
-        for c in &ch.checkpoints {
-            ws.store.insert_checkpoint(c, true)?;
-            report.pulled_checkpoints += 1;
-        }
-        ws.store.kv_set("pull_cursor", &ch.next.to_string())?;
-        tx.commit()?;
+            for c in &ch.checkpoints {
+                ws.store.insert_checkpoint(c, true)?;
+                report.pulled_checkpoints += 1;
+            }
+            ws.store.kv_set("pull_cursor", &ch.next.to_string())?;
+            Ok(())
+        })?;
         since = ch.next;
         if !ch.more {
             break;
@@ -477,70 +498,79 @@ pub fn pull(ws: &Workspace, remote: &Remote, report: &mut SyncReport) -> Result<
 }
 
 /// Make sure every object of `root` is in the local store, downloading
-/// what is missing.
+/// what is missing level by level in batches.
 pub fn ensure_objects(ws: &Workspace, root: &ObjectId, prompt: bool) -> Result<usize> {
-    if complete_locally(ws, root)? {
-        return Ok(0);
-    }
-    let Some(remote) = Remote::connect(ws, prompt)? else {
-        fail!(
-            ObjectMissing,
-            "checkpoint content {} is not available locally and no server is configured",
-            root.short()
-        );
-    };
+    let mut remote: Option<Remote> = None;
     let mut fetched = 0;
-    fetch(ws, &remote, root, Kind::Tree, &mut fetched)?;
+    let mut level = vec![*root];
+    while !level.is_empty() {
+        fetch_missing(ws, &mut remote, prompt, &level, &mut fetched)?;
+        let mut blobs = Vec::new();
+        let mut next = Vec::new();
+        for id in &level {
+            for e in ws.store.tree(id)? {
+                if e.mode == Mode::Tree {
+                    next.push(e.id);
+                } else if !ws.store.has_object(&e.id) {
+                    blobs.push(e.id);
+                }
+            }
+        }
+        blobs.sort();
+        blobs.dedup();
+        fetch_missing(ws, &mut remote, prompt, &blobs, &mut fetched)?;
+        next.sort();
+        next.dedup();
+        level = next;
+    }
     Ok(fetched)
 }
 
-fn complete_locally(ws: &Workspace, id: &ObjectId) -> Result<bool> {
-    if !ws.store.has_object(id) {
-        return Ok(false);
-    }
-    for e in ws.store.tree(id)? {
-        let ok = if e.mode == Mode::Tree {
-            complete_locally(ws, &e.id)?
-        } else {
-            ws.store.has_object(&e.id)
-        };
-        if !ok {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn fetch(
+fn fetch_missing(
     ws: &Workspace,
-    remote: &Remote,
-    id: &ObjectId,
-    kind: Kind,
+    remote: &mut Option<Remote>,
+    prompt: bool,
+    ids: &[ObjectId],
     fetched: &mut usize,
 ) -> Result<()> {
-    if !ws.store.has_object(id) {
-        let data = remote.get_object(id).map_err(|f| {
-            if f.code == ErrorCode::NotFound {
-                err!(
-                    ObjectMissing,
-                    "object {} is not on the server (pruned?)",
-                    id.short()
-                )
-            } else {
-                f
-            }
-        })?;
-        ws.store.put_compressed(id, &data)?;
-        *fetched += 1;
+    let want: Vec<ObjectId> = ids
+        .iter()
+        .filter(|id| !ws.store.has_object(id))
+        .copied()
+        .collect();
+    if want.is_empty() {
+        return Ok(());
     }
-    if kind == Kind::Tree {
-        for e in ws.store.tree(id)? {
-            let k = if e.mode == Mode::Tree {
-                Kind::Tree
-            } else {
-                Kind::Blob
-            };
-            fetch(ws, remote, &e.id, k, fetched)?;
+    if remote.is_none() {
+        *remote = Remote::connect(ws, prompt)?;
+    }
+    let Some(r) = remote.as_ref() else {
+        fail!(
+            ObjectMissing,
+            "checkpoint content ({} object(s)) is not available locally and no server is configured",
+            want.len()
+        );
+    };
+    for chunk in want.chunks(2000) {
+        let got = r.fetch_batch(chunk)?;
+        ws.store.tx(|| {
+            for (id, data) in &got {
+                ws.store.put_compressed(id, data)?;
+            }
+            Ok(())
+        })?;
+        *fetched += got.len();
+        if got.len() < chunk.len() {
+            let have: HashSet<ObjectId> = got.iter().map(|(id, _)| *id).collect();
+            let lost = chunk
+                .iter()
+                .find(|id| !have.contains(id))
+                .expect("missing id");
+            fail!(
+                ObjectMissing,
+                "object {} is not on the server (pruned or never synced)",
+                lost.short()
+            );
         }
     }
     Ok(())
@@ -597,6 +627,7 @@ pub fn background(ws: &Workspace) -> Result<Option<SyncReport>> {
         None => return Ok(None),
     };
     let mut total = SyncReport::default();
+    ws.store.maintain(1024 * 1024);
     for _ in 0..10 {
         match sync(ws, &remote) {
             Ok(r) => {

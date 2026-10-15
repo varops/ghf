@@ -20,8 +20,13 @@ fn server_bin() -> PathBuf {
     BUILT
         .get_or_init(|| {
             let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+            let release = bin().components().any(|c| c.as_os_str() == "release");
+            let mut args = vec!["build", "-q", "-p", "ghf-server"];
+            if release {
+                args.push("--release");
+            }
             let status = Command::new(cargo)
-                .args(["build", "-q", "-p", "ghf-server"])
+                .args(&args)
                 .status()
                 .expect("build ghf-server");
             assert!(status.success(), "building ghf-server failed");
