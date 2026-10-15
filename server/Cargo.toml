@@ -1,0 +1,14 @@
+[package]
+name = "ghf-server"
+description = "ghf server: canonical store for checkpoints and traces"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+ghf-proto.workspace = true
+clap.workspace = true
+
+[lints]
+workspace = true

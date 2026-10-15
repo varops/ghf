@@ -1,0 +1,19 @@
+[package]
+name = "git-hf"
+description = "ghf client: high-frequency checkpoints for AI agents, run as `git hf`"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "git-hf"
+path = "src/main.rs"
+
+[dependencies]
+ghf-proto.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
