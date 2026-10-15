@@ -130,13 +130,14 @@ async fn missing(
 ) -> ApiResult<Json<ObjectList>> {
     let repo = authorize(&s, &headers, &owner, &name)?;
     let store = s.store.lock().expect("store lock");
-    Ok(Json(ObjectList {
-        ids: req
-            .ids
-            .into_iter()
-            .filter(|id| !store.has_object(&repo, id))
-            .collect(),
-    }))
+    let (present, missing): (Vec<ObjectId>, Vec<ObjectId>) = req
+        .ids
+        .into_iter()
+        .partition(|id| store.has_object(&repo, id));
+    // A client that sees "present" will not upload; keep those objects out
+    // of the GC grace window until its checkpoint lands.
+    store.touch_objects(&repo, &present)?;
+    Ok(Json(ObjectList { ids: missing }))
 }
 
 async fn put_object(
@@ -252,6 +253,14 @@ async fn put_hold(
     Json(req): Json<HoldRequest>,
 ) -> ApiResult<Json<TraceRecord>> {
     let repo = authorize(&s, &headers, &owner, &name)?;
+    if hold.is_empty()
+        || hold.len() > 64
+        || !hold
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    {
+        return Err(bad(ErrorCode::Usage, "invalid hold name"));
+    }
     let store = s.store.lock().expect("store lock");
     let mut t = store
         .trace(&repo, &id)?

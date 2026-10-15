@@ -538,6 +538,22 @@ impl Store {
         )?)
     }
 
+    /// The server refused this checkpoint permanently. It stays restorable
+    /// locally but is no longer retried (`synced = 2`).
+    pub fn mark_rejected(&self, id: &str) -> Result<()> {
+        self.db
+            .execute("UPDATE checkpoints SET synced = 2 WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    pub fn rejected_count(&self) -> Result<i64> {
+        Ok(self.db.query_row(
+            "SELECT COUNT(*) FROM checkpoints WHERE synced = 2",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
     pub fn mark_synced(&self, id: &str) -> Result<()> {
         self.db
             .execute("UPDATE checkpoints SET synced = 1 WHERE id = ?1", [id])?;

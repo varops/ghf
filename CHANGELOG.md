@@ -33,6 +33,13 @@ This is the first release candidate. It implements the full ghf MVP: capture, sy
   - The full reference is in `docs/cli.md`.
 - **Agent skill:** `git hf skill install`.
 
+- **Safety.**
+  - Manifests with unsafe entry names (`..`, `/`, `.git`, duplicates) are rejected by both client and server, so a restore can never write outside its worktree.
+  - Restore and apply refuse, before changing anything, when an ignored, skipped or untracked file is in the way.
+  - Local garbage collection marks and sweeps in one transaction.
+  - Racily-clean files are never cached.
+  - Pending reports protect the traces that unsynced forks were made from.
+
 ### Server (`ghf-server`)
 
 - **Packaging:** one binary plus a data directory (SQLite), with optional built-in TLS.

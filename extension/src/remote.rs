@@ -307,6 +307,8 @@ pub struct SyncReport {
     pub pulled_traces: usize,
     pub pulled_checkpoints: usize,
     pub pending: i64,
+    /// Checkpoints the server refused permanently; kept locally, not retried.
+    pub rejected: Vec<String>,
 }
 
 fn client_id(ws: &Workspace) -> Result<String> {
@@ -318,6 +320,9 @@ fn client_id(ws: &Workspace) -> Result<String> {
     Ok(id)
 }
 
+/// Traces the server must not prune yet: those with unsynced checkpoints,
+/// and the traces their fork bases live in (the server may not know about
+/// the fork yet).
 fn pending_traces(ws: &Workspace) -> Result<Vec<String>> {
     let mut ids: Vec<String> = ws
         .store
@@ -325,6 +330,16 @@ fn pending_traces(ws: &Workspace) -> Result<Vec<String>> {
         .into_iter()
         .map(|c| c.trace_id)
         .collect();
+    let mut bases = Vec::new();
+    for id in &ids {
+        if let Some(t) = ws.store.trace(id)?
+            && let Some(f) = &t.record.forked_from
+            && let Some(c) = ws.store.checkpoint(f)?
+        {
+            bases.push(c.trace_id);
+        }
+    }
+    ids.extend(bases);
     ids.sort();
     ids.dedup();
     Ok(ids)
@@ -412,15 +427,37 @@ pub fn sync(ws: &Workspace, remote: &Remote) -> Result<SyncReport> {
 
     for ck in ws.store.unsynced()? {
         let mut sent = upload_closure(ws, remote, &ck.root, true, &mut report)?;
-        match remote.put_checkpoint(&ck) {
-            Err(f) if f.code == ErrorCode::ObjectMissing => {
-                // The server lost objects we thought it had (pruned); stop
-                // trusting the cache and check the whole closure.
-                ws.store.forget_remote()?;
-                sent = upload_closure(ws, remote, &ck.root, false, &mut report)?;
-                remote.put_checkpoint(&ck)?;
+        let mut result = remote.put_checkpoint(&ck);
+        if matches!(&result, Err(f) if f.code == ErrorCode::ObjectMissing) {
+            // The server lost objects we thought it had (pruned); stop
+            // trusting the cache and check the whole closure.
+            ws.store.forget_remote()?;
+            sent = upload_closure(ws, remote, &ck.root, false, &mut report)?;
+            result = remote.put_checkpoint(&ck);
+        }
+        match result {
+            Ok(()) => {}
+            // A permanent refusal (for example, its trace was pruned on the
+            // server) must not block every later checkpoint.
+            Err(f)
+                if matches!(
+                    f.code,
+                    ErrorCode::TraceState | ErrorCode::NotFound | ErrorCode::Usage
+                ) =>
+            {
+                ws.store.tx(|| {
+                    ws.store.mark_rejected(&ck.id)?;
+                    ws.store.record_failure(
+                        Some(&ck.context_id),
+                        f.code.as_str(),
+                        &format!("server rejected checkpoint {}: {}", ck.id, f.message),
+                        false,
+                    )
+                })?;
+                report.rejected.push(ck.id.clone());
+                continue;
             }
-            r => r?,
+            Err(f) => return Err(f),
         }
         // The server verified the closure: remember it to skip next time.
         ws.store.tx(|| {

@@ -43,7 +43,7 @@ The `hook` command is the one exception: it answers in the harness's own format.
 | `E_NOT_INITIALIZED` | 2 | No `.ghf`; run `git hf init` |
 | `E_CONFIG` | 2 | Invalid `.ghf` or user configuration |
 | `E_AMBIGUOUS` | 2 | A reference prefix matches more than one item |
-| `E_WORKTREE_DIRTY` | 3 | Uncaptured changes would be lost |
+| `E_WORKTREE_DIRTY` | 3 | Uncaptured changes would be lost; `data.paths` when ignored or skipped files are in the way |
 | `E_WRITER_LOCKED` | 3 | Another writer holds this worktree's trace; `data.writer`, `data.lease_expires_at` |
 | `E_NO_OPEN_TRACE` | 3 | This worktree has no trace yet |
 | `E_TRACE_STATE` | 3 | The trace's state does not allow this |
@@ -90,7 +90,7 @@ The `hook` command is the one exception: it answers in the harness's own format.
 - **Times** are Unix milliseconds.
 - **`changes[].status`** is one of `added`, `modified`, `deleted`, `renamed` or `mode`.
 - **`changes`** compares the checkpoint with its parent. A trace's first checkpoint is compared with Git `HEAD` instead.
-- **`skipped[].reason`** is one of `too_large`, `non_utf8_path`, `unreadable`, `submodule` or `special_file`.
+- **`skipped[].reason`** is one of `too_large`, `non_utf8_path`, `unsafe_path`, `unreadable`, `submodule` or `special_file`.
 
 **Trace:**
 
@@ -124,7 +124,7 @@ Data: `{path, created, config, context, trusted}`.
 Data:
 
 ```text
-{repository_root, context, capture_mode, trace, latest_checkpoint, unsynced,
+{repository_root, context, capture_mode, trace, latest_checkpoint, unsynced, rejected,
  last_sync_at, last_sync_error, capture_failures[], server, warnings[]}
 ```
 
@@ -150,13 +150,14 @@ Data: `{created, trace_created, checkpoint, trace}`.
 Pushes traces, checkpoints and holds, then pulls metadata from other machines.
 
 - **Content is lazy:** it is fetched on restore, diff or apply.
+- **Refused checkpoints:** a checkpoint the server refuses permanently (for example, its trace was pruned there) is listed in `rejected`. It stays restorable on this machine and no longer blocks later uploads.
 - **On failure:** `data.pending` holds the count still to push.
 
 Data:
 
 ```text
 {pushed_traces, pushed_checkpoints, pushed_objects, pushed_bytes, hold_ops,
- pulled_traces, pulled_checkpoints, pending}
+ pulled_traces, pulled_checkpoints, pending, rejected[]}
 ```
 
 ### `trust [URL]` · `login [--server URL]`
@@ -196,7 +197,7 @@ Data: `{worktree, base_rev, context, trace, checkpoint, restored_from, files_wri
 Runs only if the working tree matches the latest checkpoint of this worktree's open trace. Otherwise it fails with `E_WORKTREE_DIRTY`.
 
 - **`--force`** checkpoints first; that checkpoint's id is in `pre_restore_checkpoint`.
-- **Untouched:** ignored files are never touched.
+- **Untouched:** files ghf did not capture are never touched. That covers ignored files, skipped files and anything else not in the scan. If the checkpoint needs one of those paths, the restore is refused with `E_WORKTREE_DIRTY` and `data.paths`, before anything changes.
 - **History:** the result is recorded as a new checkpoint.
 
 Data: `{restored_from, checkpoint, pre_restore_checkpoint, files_written, files_deleted}`.
@@ -209,7 +210,7 @@ Three-way merges the changes between two checkpoints onto the working tree. Text
 - `A..` means A to the latest checkpoint of A's trace.
 - `ID` alone means the parent of ID to ID.
 
-**On conflict:** it stops with `E_APPLY_CONFLICT` and leaves the tree unchanged. With `--write-conflicts`, it writes the merge with conflict markers instead.
+**On conflict:** it stops with `E_APPLY_CONFLICT` and leaves the tree unchanged. With `--write-conflicts`, it writes content conflicts with conflict markers instead. File/directory collisions and uncaptured files in the way always refuse, even with `--write-conflicts`.
 
 **History:** pending work is checkpointed before the apply, and the result is checkpointed after.
 

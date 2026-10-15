@@ -1,7 +1,9 @@
 //! Write a manifest's state onto a worktree.
 //!
 //! Only captured paths are touched: files ignored by `.gitignore` or
-//! `.ghfignore` are never written or deleted.
+//! `.ghfignore`, skipped files and anything else not in the current scan are
+//! never written, replaced or deleted. If the target needs such a path, the
+//! whole operation is refused before anything changes.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -10,11 +12,12 @@ use std::path::Path;
 
 use ghf_proto::object::Mode;
 use serde::Serialize;
+use serde_json::json;
 
 use crate::error::{Context, Result};
-use crate::fail;
 use crate::scan::Manifest;
 use crate::store::Store;
+use crate::{err, fail};
 
 #[derive(Debug, Default, Serialize)]
 pub struct Stats {
@@ -39,6 +42,17 @@ pub fn materialize(
                 e.id.short()
             );
         }
+    }
+
+    let blocked = blockers(root, target, current);
+    if !blocked.is_empty() {
+        return Err(err!(
+            WorktreeDirty,
+            "{} path(s) hold files ghf did not capture (ignored, skipped or untracked); move them or restore into a new worktree: {}",
+            blocked.len(),
+            blocked.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+        )
+        .with_data(json!({"paths": blocked})));
     }
 
     let mut stats = Stats::default();
@@ -106,6 +120,70 @@ pub fn materialize(
         }
     }
     Ok(stats)
+}
+
+/// Paths where writing `target` would clobber something not captured in
+/// `current`: an uncaptured file at a target path, an uncaptured file where a
+/// target needs a directory, or a directory holding uncaptured files where a
+/// target needs a file. Also reports targets that collide with each other.
+pub fn blockers(root: &Path, target: &Manifest, current: &Manifest) -> Vec<String> {
+    let mut out = BTreeSet::new();
+    for (path, e) in target {
+        let unchanged = current.get(path) == Some(e);
+        let mut prefix = String::new();
+        let parts: Vec<&str> = path.split('/').collect();
+        for part in &parts[..parts.len() - 1] {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
+            if target.contains_key(&prefix) {
+                out.insert(prefix.clone());
+                continue;
+            }
+            if !unchanged
+                && let Ok(md) = fs::symlink_metadata(root.join(&prefix))
+                && !md.is_dir()
+                && !current.contains_key(&prefix)
+            {
+                out.insert(prefix.clone());
+            }
+        }
+        if unchanged || current.contains_key(path) {
+            continue;
+        }
+        match fs::symlink_metadata(root.join(path)) {
+            Ok(md) if md.is_dir() => {
+                if holds_uncaptured(root, path, current) {
+                    out.insert(path.clone());
+                }
+            }
+            Ok(_) => {
+                out.insert(path.clone());
+            }
+            Err(_) => {}
+        }
+    }
+    out.into_iter().collect()
+}
+
+fn holds_uncaptured(root: &Path, rel: &str, current: &Manifest) -> bool {
+    let Ok(entries) = fs::read_dir(root.join(rel)) else {
+        return true;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let child = format!("{rel}/{name}");
+        let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
+        if if is_dir {
+            holds_uncaptured(root, &child, current)
+        } else {
+            !current.contains_key(&child)
+        } {
+            return true;
+        }
+    }
+    false
 }
 
 /// Ensure every ancestor of `path` is a directory, removing captured files

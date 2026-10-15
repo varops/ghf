@@ -1,5 +1,5 @@
-//! Server storage: SQLite metadata plus per-repository content-addressed
-//! object directories under the data dir.
+//! Server storage: one SQLite database holding metadata and per-repository
+//! content-addressed objects.
 
 use std::collections::HashSet;
 use std::fs;
@@ -257,11 +257,30 @@ impl Store {
         let tx = self.db.unchecked_transaction()?;
         {
             let mut st = tx.prepare(
-                "INSERT OR IGNORE INTO objects (repo, id, data, created_at) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO objects (repo, id, data, created_at) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(repo, id) DO UPDATE SET created_at = excluded.created_at",
             )?;
             let now = ghf_proto::id::now_ms();
             for (id, data) in objects {
                 st.execute(params![repo, &id.0[..], data, now])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Refresh objects' age so GC's grace period protects them.
+    pub fn touch_objects(&self, repo: &str, ids: &[ObjectId]) -> DbResult<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let tx = self.db.unchecked_transaction()?;
+        {
+            let mut st =
+                tx.prepare("UPDATE objects SET created_at = ?3 WHERE repo = ?1 AND id = ?2")?;
+            let now = ghf_proto::id::now_ms();
+            for id in ids {
+                st.execute(params![repo, &id.0[..], now])?;
             }
         }
         tx.commit()?;
@@ -282,7 +301,12 @@ impl Store {
                 ));
             }
         };
-        Ok(object::decode_tree(body))
+        object::decode_tree(body).map(Some).ok_or_else(|| {
+            Error::new(
+                ghf_proto::ErrorCode::Usage,
+                format!("tree {} is malformed or has unsafe entry names", id.short()),
+            )
+        })
     }
 
     /// First missing object in the closure of `root`, if any.

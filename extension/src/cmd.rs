@@ -307,6 +307,12 @@ pub fn status(env: &Env) -> Result<Out> {
         }
     };
     human.push(format!("{unsynced} checkpoint(s) not synced"));
+    let rejected = ws.store.rejected_count()?;
+    if rejected > 0 {
+        warnings.push(format!(
+            "{rejected} checkpoint(s) were refused by the server and exist only on this machine"
+        ));
+    }
     if let Some(e) = &last_sync_error {
         warnings.push(format!(
             "last sync failed: {} ({})",
@@ -347,6 +353,7 @@ pub fn status(env: &Env) -> Result<Out> {
             "trace": trace,
             "latest_checkpoint": latest,
             "unsynced": unsynced,
+            "rejected": rejected,
             "last_sync_at": last_sync_at,
             "last_sync_error": last_sync_error,
             "capture_failures": failures.iter().map(|(at, code, msg, strict)| json!({
@@ -837,14 +844,17 @@ pub fn trace_restore(
     if let Some(t) = &open {
         capture::check_writer(&ws, t, &writer, false)?;
     }
-    let current = scan::scan(&ws.repo, &ws.store, &capture::scan_options(&ws, false)?)?;
-    let latest = match &open {
-        Some(t) => ws.store.latest_checkpoint(&t.record.id)?,
-        None => None,
-    };
-    let clean = latest.as_ref().is_some_and(|l| l.root == current.root);
-    let mut pre = None;
-    if !clean {
+    // Scan once: the guard, the pre-restore checkpoint and the restore all
+    // see the same state. The checkpoint is durable before the tree changes.
+    let (current, pre) = ws.store.tx(|| {
+        let snap = scan::scan(&ws.repo, &ws.store, &capture::scan_options(&ws, true)?)?;
+        let latest = match &open {
+            Some(t) => ws.store.latest_checkpoint(&t.record.id)?,
+            None => None,
+        };
+        if latest.as_ref().is_some_and(|l| l.root == snap.root) {
+            return Ok((snap, None));
+        }
         if !force {
             return Err(err!(
                 WorktreeDirty,
@@ -859,8 +869,9 @@ pub fn trace_restore(
             writer: writer.clone(),
             ..Default::default()
         };
-        pre = Some(capture::checkpoint_locked(&ws, &req)?.checkpoint);
-    }
+        let o = capture::record(&ws, open.clone(), snap.clone(), &req, None)?;
+        Ok((snap, Some(o.checkpoint)))
+    })?;
     let target = scan::flatten(&ws.store, &ck.root)?;
     let stats = materialize::materialize(&ws.repo.root, &ws.store, &target, &current.files)?;
     let req = Request {
@@ -872,11 +883,15 @@ pub fn trace_restore(
     };
     let o = capture::checkpoint_locked(&ws, &req)?;
     if o.checkpoint.root != ck.root {
+        let undo = pre
+            .as_ref()
+            .map(|p| p.id.clone())
+            .or_else(|| o.checkpoint.parent.clone())
+            .unwrap_or_else(|| "@~1".into());
         fail!(
             Internal,
-            "worktree does not match {} after restore; recover with `git hf trace restore {} --in-place --force`",
-            ck.id,
-            o.checkpoint.parent.as_deref().unwrap_or("@~1")
+            "worktree does not match {} after restore (something wrote to it concurrently?); recover with `git hf trace restore {undo} --in-place --force`",
+            ck.id
         );
     }
     remote::spawn_background(&ws);
@@ -905,6 +920,109 @@ pub fn trace_fork(env: &Env, r: String, worktree: Option<PathBuf>) -> Result<Out
 struct Conflict {
     path: String,
     reason: &'static str,
+    /// Cannot be written as conflict markers; always refuses the apply.
+    #[serde(skip)]
+    hard: bool,
+}
+
+/// Merge `a..b` onto `current`: the target manifest and any conflicts.
+/// Merged blobs are stored in the local store.
+fn plan_apply(
+    ws: &Workspace,
+    deltas: &[scan::Delta],
+    current: &Manifest,
+    write_conflicts: bool,
+) -> Result<(Manifest, Vec<Conflict>)> {
+    let mut target = current.clone();
+    let mut conflicts = Vec::new();
+    let tmp = ws.store.tmp_dir();
+    let soft = |path: &str, reason| Conflict {
+        path: path.to_owned(),
+        reason,
+        hard: false,
+    };
+
+    for d in deltas {
+        let ours = current.get(&d.path).copied();
+        if ours == d.new {
+            continue;
+        }
+        if ours == d.old {
+            match d.new {
+                Some(n) => target.insert(d.path.clone(), n),
+                None => target.remove(&d.path),
+            };
+            continue;
+        }
+        let regular = |e: &Option<FileEntry>| e.is_none_or(|e| e.mode != Mode::Symlink);
+        let (Some(o), Some(n)) = (ours, d.new) else {
+            conflicts.push(soft(
+                &d.path,
+                if d.new.is_none() {
+                    "deleted incoming, modified in working tree"
+                } else {
+                    "modified incoming, deleted in working tree"
+                },
+            ));
+            continue;
+        };
+        if !regular(&Some(o)) || !regular(&Some(n)) || !regular(&d.old) {
+            conflicts.push(soft(&d.path, "symlink changed on both sides"));
+            continue;
+        }
+        let base = match d.old {
+            Some(e) => ws.store.blob(&e.id)?,
+            None => Vec::new(),
+        };
+        let (ob, nb) = (ws.store.blob(&o.id)?, ws.store.blob(&n.id)?);
+        if is_binary(&ob) || is_binary(&nb) || is_binary(&base) {
+            conflicts.push(soft(&d.path, "binary file changed on both sides"));
+            continue;
+        }
+        let tag = ghf_proto::id::random_hex(6);
+        let (po, pb, pt) = (
+            tmp.join(format!("ours-{tag}")),
+            tmp.join(format!("base-{tag}")),
+            tmp.join(format!("theirs-{tag}")),
+        );
+        fs::write(&po, &ob)?;
+        fs::write(&pb, &base)?;
+        fs::write(&pt, &nb)?;
+        let merged = ws.repo.merge_file(&po, &pb, &pt);
+        for p in [&po, &pb, &pt] {
+            let _ = fs::remove_file(p);
+        }
+        let (bytes, conflicted) = merged?;
+        if conflicted {
+            conflicts.push(soft(&d.path, "content changed on both sides"));
+            if !write_conflicts {
+                continue;
+            }
+        }
+        let id = ws.store.put(ghf_proto::object::Kind::Blob, &bytes)?;
+        let mode = if d.old.is_some_and(|b| b.mode == o.mode) {
+            n.mode
+        } else {
+            o.mode
+        };
+        target.insert(
+            d.path.clone(),
+            FileEntry {
+                mode,
+                id,
+                size: bytes.len() as u64,
+            },
+        );
+    }
+    // File/directory collisions and uncaptured files in the way.
+    for path in materialize::blockers(&ws.repo.root, &target, current) {
+        conflicts.push(Conflict {
+            path,
+            reason: "file/directory collision or uncaptured file in the way",
+            hard: true,
+        });
+    }
+    Ok((target, conflicts))
 }
 
 pub fn trace_apply(env: &Env, range: String, write_conflicts: bool) -> Result<Out> {
@@ -941,120 +1059,40 @@ pub fn trace_apply(env: &Env, range: String, write_conflicts: bool) -> Result<Ou
         capture::check_writer(&ws, t, &writer, false)?;
     }
     let deltas = scan::diff_trees(&ws.store, Some(&a.root), Some(&b.root))?;
-    // One transaction from the scan through the pre-apply checkpoint. An
-    // early error return leaves it open; the process exit rolls it back.
-    ws.store.db.execute_batch("BEGIN IMMEDIATE")?;
-    let current = scan::scan(&ws.repo, &ws.store, &capture::scan_options(&ws, true)?)?;
-    let mut target = current.files.clone();
-    let mut conflicts = Vec::new();
-    let tmp = ws.store.tmp_dir();
-
-    for d in &deltas {
-        let ours = current.files.get(&d.path).copied();
-        if ours == d.new {
-            continue;
+    // Scan, merge and the pre-apply checkpoint commit together, before the
+    // tree changes. A refusal rolls everything back.
+    let (current, target, conflicts, pre) = ws.store.tx(|| {
+        let current = scan::scan(&ws.repo, &ws.store, &capture::scan_options(&ws, true)?)?;
+        let (target, conflicts) = plan_apply(&ws, &deltas, &current.files, write_conflicts)?;
+        if !conflicts.is_empty() && (!write_conflicts || conflicts.iter().any(|c| c.hard)) {
+            return Err(err!(
+                ApplyConflict,
+                "{} conflicting path(s); the working tree is unchanged",
+                conflicts.len()
+            )
+            .with_data(
+                json!({"applied": false, "from": a.id, "to": b.id, "conflicts": conflicts}),
+            ));
         }
-        if ours == d.old {
-            match d.new {
-                Some(n) => target.insert(d.path.clone(), n),
-                None => target.remove(&d.path),
+        let latest = match &open {
+            Some(t) => ws.store.latest_checkpoint(&t.record.id)?,
+            None => None,
+        };
+        let mut pre = None;
+        if latest.as_ref().is_none_or(|l| l.root != current.root) {
+            let req = Request {
+                message: Some(format!("before apply {}..{}", a.id, b.id)),
+                writer: writer.clone(),
+                ..Default::default()
             };
-            continue;
+            pre = Some(
+                capture::record(&ws, open.clone(), current.clone(), &req, None)?
+                    .checkpoint
+                    .id,
+            );
         }
-        let regular = |e: &Option<FileEntry>| e.is_none_or(|e| e.mode != Mode::Symlink);
-        let (Some(o), Some(n)) = (ours, d.new) else {
-            conflicts.push(Conflict {
-                path: d.path.clone(),
-                reason: if d.new.is_none() {
-                    "deleted incoming, modified in working tree"
-                } else {
-                    "modified incoming, deleted in working tree"
-                },
-            });
-            continue;
-        };
-        if !regular(&Some(o)) || !regular(&Some(n)) || !regular(&d.old) {
-            conflicts.push(Conflict {
-                path: d.path.clone(),
-                reason: "symlink changed on both sides",
-            });
-            continue;
-        }
-        let base = match d.old {
-            Some(e) => ws.store.blob(&e.id)?,
-            None => Vec::new(),
-        };
-        let (ob, nb) = (ws.store.blob(&o.id)?, ws.store.blob(&n.id)?);
-        if is_binary(&ob) || is_binary(&nb) || is_binary(&base) {
-            conflicts.push(Conflict {
-                path: d.path.clone(),
-                reason: "binary file changed on both sides",
-            });
-            continue;
-        }
-        let tag = ghf_proto::id::random_hex(6);
-        let (po, pb, pt) = (
-            tmp.join(format!("ours-{tag}")),
-            tmp.join(format!("base-{tag}")),
-            tmp.join(format!("theirs-{tag}")),
-        );
-        fs::write(&po, &ob)?;
-        fs::write(&pb, &base)?;
-        fs::write(&pt, &nb)?;
-        let merged = ws.repo.merge_file(&po, &pb, &pt);
-        for p in [&po, &pb, &pt] {
-            let _ = fs::remove_file(p);
-        }
-        let (bytes, conflicted) = merged?;
-        if conflicted {
-            conflicts.push(Conflict {
-                path: d.path.clone(),
-                reason: "content changed on both sides",
-            });
-            if !write_conflicts {
-                continue;
-            }
-        }
-        let id = ws.store.put(ghf_proto::object::Kind::Blob, &bytes)?;
-        let mode = if d.old.is_some_and(|b| b.mode == o.mode) {
-            n.mode
-        } else {
-            o.mode
-        };
-        target.insert(
-            d.path.clone(),
-            FileEntry {
-                mode,
-                id,
-                size: bytes.len() as u64,
-            },
-        );
-    }
-
-    if !conflicts.is_empty() && !write_conflicts {
-        return Err(err!(
-            ApplyConflict,
-            "{} conflicting path(s); the working tree is unchanged",
-            conflicts.len()
-        )
-        .with_data(json!({"applied": false, "from": a.id, "to": b.id, "conflicts": conflicts})));
-    }
-
-    let latest = match &open {
-        Some(t) => ws.store.latest_checkpoint(&t.record.id)?,
-        None => None,
-    };
-    let mut pre = None;
-    if latest.as_ref().is_none_or(|l| l.root != current.root) {
-        let req = Request {
-            message: Some(format!("before apply {}..{}", a.id, b.id)),
-            writer: writer.clone(),
-            ..Default::default()
-        };
-        pre = Some(capture::checkpoint_locked(&ws, &req)?.checkpoint.id);
-    }
-    // The pre-apply checkpoint is durable before the tree changes.
-    ws.store.db.execute_batch("COMMIT")?;
+        Ok((current, target, conflicts, pre))
+    })?;
     let stats = materialize::materialize(&ws.repo.root, &ws.store, &target, &current.files)?;
     let req = Request {
         message: Some(format!("applied {}..{}", a.id, b.id)),
@@ -1067,6 +1105,16 @@ pub fn trace_apply(env: &Env, range: String, write_conflicts: bool) -> Result<Ou
         ..Default::default()
     };
     let o = capture::checkpoint_locked(&ws, &req)?;
+    if o.checkpoint.root != scan::build_tree(&target, None)? {
+        let undo = pre
+            .clone()
+            .or_else(|| o.checkpoint.parent.clone())
+            .unwrap_or_default();
+        fail!(
+            Internal,
+            "worktree does not match the planned apply result (something wrote to it concurrently?); undo with `git hf trace restore {undo} --in-place --force`"
+        );
+    }
     remote::spawn_background(&ws);
     let data = json!({
         "applied": true,
@@ -1214,8 +1262,16 @@ pub fn trace_hold(
     let ws = env.ws()?;
     let row = resolve_trace(&ws, Some(&trace), env.prompt())?;
     let mut t = row.record;
-    if name.is_empty() || name.contains('/') {
-        fail!(Usage, "hold name must be non-empty and contain no '/'");
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    {
+        fail!(
+            Usage,
+            "hold names use letters, digits, '.', '_' and '-' (at most 64)"
+        );
     }
     let now = ghf_proto::id::now_ms();
     let expires_at = match expires {
@@ -1335,26 +1391,30 @@ fn prune_local(ws: &Workspace, dry_run: bool, has_server: bool) -> Result<Value>
 /// the grace period (default one hour, `GHF_GC_GRACE`) are kept: a capture
 /// may be writing them right now.
 fn gc(ws: &Workspace) -> Result<(u64, u64)> {
-    let mut live = std::collections::HashSet::new();
-    let mut stack: Vec<ghf_proto::ObjectId> =
-        ws.store.all_checkpoints()?.iter().map(|c| c.root).collect();
-    while let Some(id) = stack.pop() {
-        if !live.insert(id) {
-            continue;
-        }
-        if let Ok(entries) = ws.store.tree(&id) {
-            for e in entries {
-                if e.mode == Mode::Tree {
-                    stack.push(e.id);
-                } else {
-                    live.insert(e.id);
-                }
-            }
-        }
-    }
     let grace = std::env::var("GHF_GC_GRACE")
         .ok()
         .and_then(|s| retention::parse_duration_ms(&s))
         .unwrap_or(3_600_000);
-    ws.store.sweep(&live, grace)
+    // Mark and sweep in one write transaction, so no capture can reference an
+    // object between the mark and its deletion.
+    ws.store.tx(|| {
+        let mut live = std::collections::HashSet::new();
+        let mut stack: Vec<ghf_proto::ObjectId> =
+            ws.store.all_checkpoints()?.iter().map(|c| c.root).collect();
+        while let Some(id) = stack.pop() {
+            if !live.insert(id) {
+                continue;
+            }
+            if let Ok(entries) = ws.store.tree(&id) {
+                for e in entries {
+                    if e.mode == Mode::Tree {
+                        stack.push(e.id);
+                    } else {
+                        live.insert(e.id);
+                    }
+                }
+            }
+        }
+        ws.store.sweep(&live, grace)
+    })
 }

@@ -733,3 +733,57 @@ fn ignore_rules() {
     );
     assert!(work.join("target/out").exists());
 }
+
+// Review regressions: restore and apply never clobber files ghf did not
+// capture, and file/directory collisions refuse the apply up front.
+#[test]
+fn never_overwrites_uncaptured_files() {
+    let root = tempdir("clobber");
+    let (_, work) = repo(&root);
+    let m = Machine::new(&root, "a");
+    init(&m, &work, None);
+    fs::write(work.join("settings.env"), "captured").unwrap();
+    let with_env = checkpoint(&m, &work, &[]);
+    fs::remove_file(work.join("settings.env")).unwrap();
+    checkpoint(&m, &work, &[]);
+    // Locally ignored now, and holding precious local content.
+    fs::write(work.join(".git/info/exclude"), "settings.env\n").unwrap();
+    fs::write(work.join("settings.env"), "local secret").unwrap();
+    checkpoint(&m, &work, &["--force"]);
+    let r = m.hf(
+        &work,
+        &[
+            "trace",
+            "restore",
+            with_env["id"].as_str().unwrap(),
+            "--in-place",
+        ],
+    );
+    assert_eq!(r.err_code(), "E_WORKTREE_DIRTY");
+    assert_eq!(r.json["data"]["paths"][0], "settings.env");
+    assert_eq!(
+        fs::read_to_string(work.join("settings.env")).unwrap(),
+        "local secret"
+    );
+
+    // Apply reports it as a conflict and leaves everything alone.
+    let base = checkpoint(&m, &work, &["--force"]);
+    fs::write(work.join("x"), "file").unwrap();
+    let tip = checkpoint(&m, &work, &[]);
+    fs::remove_file(work.join("x")).unwrap();
+    fs::create_dir_all(work.join("x")).unwrap();
+    fs::write(work.join("x/inner.txt"), "dir now").unwrap();
+    checkpoint(&m, &work, &[]);
+    let range = format!(
+        "{}..{}",
+        base["id"].as_str().unwrap(),
+        tip["id"].as_str().unwrap()
+    );
+    let r = m.hf(&work, &["trace", "apply", &range, "--write-conflicts"]);
+    assert_eq!(r.err_code(), "E_APPLY_CONFLICT");
+    assert_eq!(r.json["data"]["applied"], false);
+    assert_eq!(
+        fs::read_to_string(work.join("x/inner.txt")).unwrap(),
+        "dir now"
+    );
+}

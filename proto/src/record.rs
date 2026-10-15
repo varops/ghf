@@ -118,7 +118,7 @@ pub struct Change {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Skipped {
     pub path: String,
-    /// `too_large`, `non_utf8_path`, `unreadable`, `special_file`.
+    /// `too_large`, `non_utf8_path`, `unsafe_path`, `unreadable`, `submodule`, `special_file`.
     pub reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,

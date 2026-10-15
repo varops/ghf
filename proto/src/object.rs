@@ -178,8 +178,22 @@ pub fn encode_tree(entries: &[TreeEntry]) -> Vec<u8> {
     out
 }
 
+/// Is `name` safe as one path component in a worktree? Rejects empty
+/// names, `.`, `..`, `/`, NUL and `.git` (any case), so a manifest
+/// can never address anything outside its worktree or inside Git's own dir.
+pub fn safe_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\0'])
+        && !name.eq_ignore_ascii_case(".git")
+}
+
+/// Decode a tree. Returns `None` for malformed trees, including unsafe or
+/// duplicate entry names.
 pub fn decode_tree(body: &[u8]) -> Option<Vec<TreeEntry>> {
     let mut entries = Vec::new();
+    let mut names = std::collections::HashSet::new();
     for rec in body.split(|b| *b == 0) {
         if rec.is_empty() {
             continue;
@@ -190,6 +204,9 @@ pub fn decode_tree(body: &[u8]) -> Option<Vec<TreeEntry>> {
         let mode = Mode::from_code(parts.next()?)?;
         let size = parts.next()?.parse().ok()?;
         let id = ObjectId::from_hex(parts.next()?)?;
+        if !safe_name(name) || !names.insert(name) {
+            return None;
+        }
         entries.push(TreeEntry {
             name: name.to_owned(),
             mode,
@@ -223,6 +240,18 @@ mod tests {
         let two = encode_tree(&[b.clone(), a.clone()]);
         assert_eq!(one, two);
         assert_eq!(decode_tree(&one).unwrap(), vec![b, a]);
+    }
+
+    #[test]
+    fn unsafe_names_are_rejected() {
+        let id = hash(Kind::Blob, b"x");
+        for bad in ["..", ".", "", ".git", ".GIT", "a/b"] {
+            let body = format!("f 1 {}\t{bad}\0", id.to_hex());
+            assert!(decode_tree(body.as_bytes()).is_none(), "{bad:?} accepted");
+        }
+        let dup = format!("f 1 {0}\tx\0f 1 {0}\tx\0", id.to_hex());
+        assert!(decode_tree(dup.as_bytes()).is_none());
+        assert!(decode_tree(format!("f 1 {}\t.gitignore\0", id.to_hex()).as_bytes()).is_some());
     }
 
     #[test]

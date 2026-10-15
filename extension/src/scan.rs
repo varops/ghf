@@ -70,6 +70,14 @@ pub fn captured_paths(repo: &Repo) -> Result<(Vec<String>, Vec<Skipped>)> {
             continue;
         };
         let path = path.trim_end_matches('/').to_owned();
+        if !path.split('/').all(ghf_proto::object::safe_name) {
+            skipped.push(Skipped {
+                path,
+                reason: "unsafe_path".into(),
+                size: None,
+            });
+            continue;
+        }
         if ignore.matched_path_or_any_parents(&path, false).is_ignore() {
             continue;
         }
@@ -176,7 +184,9 @@ pub fn scan(repo: &Repo, store: &Store, opts: &ScanOptions) -> Result<Snapshot> 
             } else {
                 object::hash(Kind::Blob, &content)
             };
-            if opts.persist && opts.context_id.is_some() {
+            // Like Git's racily-clean rule: never cache a file modified so
+            // recently that a same-size rewrite could share its mtime.
+            if opts.persist && opts.context_id.is_some() && mtime < started_ns - 2_000_000_000 {
                 upserts.push((
                     path.clone(),
                     StatEntry {
