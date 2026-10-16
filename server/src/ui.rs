@@ -1299,12 +1299,12 @@ fn layout(title: &str, crumbs: &[(String, Option<String>)], signed_in: bool, bod
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-                  <title>{} · ghf</title><link rel=\"stylesheet\" href=\"/ui/style.css\"></head>\
+         <title>{} · ghf</title><link rel=\"stylesheet\" href=\"/ui/style.css?v={version}\"></head>\
          <body><header><nav aria-label=\"Breadcrumb\">{nav}</nav>{logout}</header>\
-         <main>{body}</main><footer class=\"muted small\">ghf-server {} · read-only viewer</footer>\
+         <main>{body}</main><footer class=\"muted small\">ghf-server {version} · read-only viewer</footer>\
          </body></html>",
         esc(title),
-        env!("CARGO_PKG_VERSION")
+        version = env!("CARGO_PKG_VERSION")
     )
 }
 
@@ -1431,6 +1431,7 @@ header {
   padding: .75rem 1.25rem; border-bottom: 1px solid var(--border); background: var(--panel);
 }
 header form { margin: 0; }
+header a, header button.link { color: inherit; }
 main { max-width: 1200px; margin: 0 auto; padding: 1.25rem; }
 footer { max-width: 1200px; margin: 2rem auto; padding: 0 1.25rem; }
 a { color: var(--link); }
