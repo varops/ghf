@@ -224,6 +224,16 @@ git hf trace log <trace>
 git hf trace diff <a> <b>
 ```
 
+### Viewing traces in a browser
+
+Reviewers without ghf installed can use the server's web viewer. Create a read-only token for them:
+
+```bash
+ghf-server --data-dir /var/lib/ghf token create --name review --repos 'acme/project' --read-only
+```
+
+They open `https://ghf.example.com/ui`, paste the token once, and can browse every trace in the repositories it covers: the timeline of checkpoints with their messages and `tests=pass`/`fail` annotations, diffs between any two checkpoints, and files as they were at each one. Page URLs are stable, so you can paste a link to a trace or diff into a review. The viewer never changes anything. See the [server guide](server.md#viewing-traces-in-a-browser) for details.
+
 ## 8. Finishing work
 
 Commit and push the way you always do. Then tell ghf the work is done:

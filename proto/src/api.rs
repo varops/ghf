@@ -2,6 +2,8 @@
 //!
 //! All repository routes live under `/v1/repos/{owner}/{name}/` and require
 //! `Authorization: Bearer <token>`. Errors return [`ApiError`] as JSON.
+//! Read-only tokens may use only the GET routes and `objects/fetch`; every
+//! other route refuses them with `E_AUTH`.
 //!
 //! | Method | Path | Body | Response |
 //! |---|---|---|---|

@@ -17,6 +17,10 @@ humantime.workspace = true
 axum.workspace = true
 axum-server.workspace = true
 tokio.workspace = true
+similar.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 
 [lints]
 workspace = true

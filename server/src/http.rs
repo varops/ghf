@@ -21,6 +21,8 @@ pub struct AppState {
     pub store: Mutex<Store>,
     pub server_id: String,
     pub policy: Policy,
+    /// Mark UI session cookies `Secure` (the server terminates TLS).
+    pub secure_cookies: bool,
 }
 
 pub type Shared = Arc<AppState>;
@@ -48,9 +50,9 @@ impl IntoResponse for Error {
     }
 }
 
-type ApiResult<T> = Result<T, Error>;
+pub(crate) type ApiResult<T> = Result<T, Error>;
 
-fn bad(code: ErrorCode, msg: impl Into<String>) -> Error {
+pub(crate) fn bad(code: ErrorCode, msg: impl Into<String>) -> Error {
     Error::new(code, msg)
 }
 
@@ -72,6 +74,7 @@ pub fn router(state: Shared) -> Router {
         .route("/prune", post(prune_handler));
     Router::new()
         .route("/v1/info", get(info))
+        .merge(crate::ui::router())
         .nest("/v1/repos/{owner}/{name}", repo)
         .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))
         .with_state(state)
@@ -85,8 +88,21 @@ async fn info(State(s): State<Shared>) -> Json<ServerInfo> {
     })
 }
 
-/// Authorize a request for `owner/name`. Returns the repository name.
-fn authorize(s: &AppState, headers: &HeaderMap, owner: &str, name: &str) -> ApiResult<String> {
+/// Whether a route reads or changes server state.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Access {
+    Read,
+    Write,
+}
+
+/// Check `token` against `owner/name`. Returns the repository name.
+fn check_token(
+    s: &AppState,
+    token: &str,
+    owner: &str,
+    name: &str,
+    access: Access,
+) -> ApiResult<String> {
     let repo = format!("{owner}/{name}");
     if !ghf_proto::api::valid_repo(&repo) {
         return Err(bad(
@@ -94,28 +110,38 @@ fn authorize(s: &AppState, headers: &HeaderMap, owner: &str, name: &str) -> ApiR
             format!("invalid repository {repo:?}"),
         ));
     }
-    let token = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or_else(|| bad(ErrorCode::Auth, "missing bearer token"))?;
-    let scope = s
+    let info = s
         .store
         .lock()
         .expect("store lock")
-        .token_scope(token)?
+        .token(token)?
         .ok_or_else(|| bad(ErrorCode::Auth, "invalid or revoked token"))?;
-    let allowed = scope
-        .split(',')
-        .map(str::trim)
-        .any(|r| r == "*" || r == repo || r.strip_suffix("/*").is_some_and(|o| o == owner));
-    if !allowed {
+    if !info.allows(owner, name) {
         return Err(bad(
             ErrorCode::Auth,
             format!("token has no access to {repo}"),
         ));
     }
+    if access == Access::Write && info.read_only {
+        return Err(bad(ErrorCode::Auth, "token is read-only"));
+    }
     Ok(repo)
+}
+
+/// Authorize a request for `owner/name`. Returns the repository name.
+fn authorize(
+    s: &AppState,
+    headers: &HeaderMap,
+    owner: &str,
+    name: &str,
+    access: Access,
+) -> ApiResult<String> {
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or_else(|| bad(ErrorCode::Auth, "missing bearer token"))?;
+    check_token(s, token, owner, name, access)
 }
 
 fn object_id(s: &str) -> ApiResult<ObjectId> {
@@ -128,7 +154,7 @@ async fn missing(
     headers: HeaderMap,
     Json(req): Json<ObjectList>,
 ) -> ApiResult<Json<ObjectList>> {
-    let repo = authorize(&s, &headers, &owner, &name)?;
+    let repo = authorize(&s, &headers, &owner, &name, Access::Write)?;
     let store = s.store.lock().expect("store lock");
     let (present, missing): (Vec<ObjectId>, Vec<ObjectId>) = req
         .ids
@@ -146,7 +172,7 @@ async fn put_object(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<StatusCode> {
-    let repo = authorize(&s, &headers, &owner, &name)?;
+    let repo = authorize(&s, &headers, &owner, &name, Access::Write)?;
     let id = object_id(&id)?;
     let s2 = s.clone();
     // Verification and the database write happen off the async runtime.
@@ -165,7 +191,7 @@ async fn put_batch(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<StatusCode> {
-    let repo = authorize(&s, &headers, &owner, &name)?;
+    let repo = authorize(&s, &headers, &owner, &name, Access::Write)?;
     let s2 = s.clone();
     tokio::task::spawn_blocking(move || {
         let objects = ghf_proto::api::unframe(&body)
@@ -184,7 +210,7 @@ async fn fetch_batch(
     headers: HeaderMap,
     Json(req): Json<ObjectList>,
 ) -> ApiResult<Response> {
-    let repo = authorize(&s, &headers, &owner, &name)?;
+    let repo = authorize(&s, &headers, &owner, &name, Access::Read)?;
     if req.ids.len() > 10_000 {
         return Err(bad(ErrorCode::Usage, "at most 10000 ids per fetch"));
     }
@@ -203,7 +229,7 @@ async fn get_object(
     Path((owner, name, id)): Path<(String, String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    let repo = authorize(&s, &headers, &owner, &name)?;
+    let repo = authorize(&s, &headers, &owner, &name, Access::Read)?;
     let id = object_id(&id)?;
     let data = s
         .store
@@ -225,7 +251,7 @@ async fn put_trace(
     headers: HeaderMap,
     Json(t): Json<TraceRecord>,
 ) -> ApiResult<Json<TraceRecord>> {
-    let repo = authorize(&s, &headers, &owner, &name)?;
+    let repo = authorize(&s, &headers, &owner, &name, Access::Write)?;
     if t.id != id || !ghf_proto::id::is_id(ghf_proto::id::TRACE, &id) {
         return Err(bad(ErrorCode::Usage, "trace id mismatch"));
     }
@@ -238,7 +264,7 @@ async fn get_trace(
     Path((owner, name, id)): Path<(String, String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<TraceRecord>> {
-    let repo = authorize(&s, &headers, &owner, &name)?;
+    let repo = authorize(&s, &headers, &owner, &name, Access::Read)?;
     let store = s.store.lock().expect("store lock");
     store
         .trace(&repo, &id)?
@@ -252,7 +278,7 @@ async fn put_hold(
     headers: HeaderMap,
     Json(req): Json<HoldRequest>,
 ) -> ApiResult<Json<TraceRecord>> {
-    let repo = authorize(&s, &headers, &owner, &name)?;
+    let repo = authorize(&s, &headers, &owner, &name, Access::Write)?;
     if hold.is_empty()
         || hold.len() > 64
         || !hold
@@ -286,7 +312,7 @@ async fn delete_hold(
     Path((owner, name, id, hold)): Path<(String, String, String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<TraceRecord>> {
-    let repo = authorize(&s, &headers, &owner, &name)?;
+    let repo = authorize(&s, &headers, &owner, &name, Access::Write)?;
     let store = s.store.lock().expect("store lock");
     let mut t = store
         .trace(&repo, &id)?
@@ -305,7 +331,7 @@ async fn put_checkpoint(
     headers: HeaderMap,
     Json(c): Json<CheckpointRecord>,
 ) -> ApiResult<StatusCode> {
-    let repo = authorize(&s, &headers, &owner, &name)?;
+    let repo = authorize(&s, &headers, &owner, &name, Access::Write)?;
     if c.id != id || !ghf_proto::id::is_id(ghf_proto::id::CHECKPOINT, &id) {
         return Err(bad(ErrorCode::Usage, "checkpoint id mismatch"));
     }
@@ -352,7 +378,7 @@ async fn changes(
     Query(q): Query<Since>,
     headers: HeaderMap,
 ) -> ApiResult<Json<ghf_proto::api::Changes>> {
-    let repo = authorize(&s, &headers, &owner, &name)?;
+    let repo = authorize(&s, &headers, &owner, &name, Access::Read)?;
     let store = s.store.lock().expect("store lock");
     Ok(Json(store.changes(&repo, q.since, 500)?))
 }
@@ -363,7 +389,7 @@ async fn put_pending(
     headers: HeaderMap,
     Json(req): Json<PendingReport>,
 ) -> ApiResult<StatusCode> {
-    let repo = authorize(&s, &headers, &owner, &name)?;
+    let repo = authorize(&s, &headers, &owner, &name, Access::Write)?;
     if client.is_empty() || client.len() > 64 {
         return Err(bad(ErrorCode::Usage, "invalid client id"));
     }
@@ -379,7 +405,7 @@ async fn policy(
     Path((owner, name)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Policy>> {
-    let repo = authorize(&s, &headers, &owner, &name)?;
+    let repo = authorize(&s, &headers, &owner, &name, Access::Read)?;
     Ok(Json(
         s.store
             .lock()
@@ -394,7 +420,7 @@ async fn prune_handler(
     headers: HeaderMap,
     Json(req): Json<PruneRequest>,
 ) -> ApiResult<Json<ghf_proto::api::PruneReport>> {
-    let repo = authorize(&s, &headers, &owner, &name)?;
+    let repo = authorize(&s, &headers, &owner, &name, Access::Write)?;
     let s2 = s.clone();
     let report = tokio::task::spawn_blocking(move || {
         let store = s2.store.lock().expect("store lock");

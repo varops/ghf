@@ -4,6 +4,9 @@
 mod http;
 mod prune;
 mod store;
+#[cfg(test)]
+mod tests;
+mod ui;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -91,6 +94,9 @@ enum TokenCommand {
         /// Comma-separated repositories: `owner/name`, `owner/*` or `*`.
         #[arg(long)]
         repos: String,
+        /// Allow reads only: pushes, holds, pending reports and prune are refused.
+        #[arg(long)]
+        read_only: bool,
     },
     /// List tokens (not their values).
     List,
@@ -125,7 +131,11 @@ fn main() {
     };
     let store = Store::open(&dir).unwrap_or_else(|e| die(e.message));
     match cli.command {
-        Command::Token(TokenCommand::Create { name, repos }) => {
+        Command::Token(TokenCommand::Create {
+            name,
+            repos,
+            read_only,
+        }) => {
             for r in repos.split(',').map(str::trim) {
                 let ok = r == "*"
                     || ghf_proto::api::valid_repo(r)
@@ -136,18 +146,24 @@ fn main() {
                 }
             }
             let token = store
-                .create_token(&name, &repos)
+                .create_token(&name, &repos, read_only)
                 .unwrap_or_else(|e| die(e.message));
             println!("{token}");
         }
         Command::Token(TokenCommand::List) => {
-            for (name, repos, at, revoked) in store.list_tokens().unwrap_or_else(|e| die(e.message))
-            {
-                let t = std::time::UNIX_EPOCH + Duration::from_millis(at as u64);
+            for t in store.list_tokens().unwrap_or_else(|e| die(e.message)) {
+                let at = std::time::UNIX_EPOCH + Duration::from_millis(t.created_at as u64);
                 println!(
-                    "{name}\t{repos}\t{}{}",
-                    humantime::format_rfc3339_seconds(t),
-                    if revoked { "\trevoked" } else { "" }
+                    "{}\t{}\t{}\t{}{}",
+                    t.name,
+                    t.repos,
+                    humantime::format_rfc3339_seconds(at),
+                    if t.read_only {
+                        "read-only"
+                    } else {
+                        "read-write"
+                    },
+                    if t.revoked { "\trevoked" } else { "" }
                 );
             }
         }
@@ -205,6 +221,7 @@ fn main() {
                 store: Mutex::new(store),
                 server_id: server_id.clone(),
                 policy: p,
+                secure_cookies: tls_cert.is_some(),
             });
             let rt = tokio::runtime::Runtime::new().unwrap_or_else(|e| die(e));
             rt.block_on(serve(

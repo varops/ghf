@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS tokens (
     name TEXT NOT NULL,
     repos TEXT NOT NULL,
     created_at INTEGER NOT NULL,
-    revoked INTEGER NOT NULL DEFAULT 0
+    revoked INTEGER NOT NULL DEFAULT 0,
+    read_only INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS repos (
     name TEXT PRIMARY KEY,
@@ -102,6 +103,43 @@ pub struct Store {
     pub dir: PathBuf,
 }
 
+/// A valid token's grants.
+#[derive(Debug, Clone)]
+pub struct TokenInfo {
+    /// Comma-separated scopes: `owner/name`, `owner/*` or `*`.
+    pub repos: String,
+    pub read_only: bool,
+}
+
+impl TokenInfo {
+    /// Whether the token's scope covers `owner/name`.
+    pub fn allows(&self, owner: &str, name: &str) -> bool {
+        let repo = format!("{owner}/{name}");
+        self.repos
+            .split(',')
+            .map(str::trim)
+            .any(|r| r == "*" || r == repo || r.strip_suffix("/*").is_some_and(|o| o == owner))
+    }
+}
+
+/// A token as `token list` shows it.
+pub struct TokenRow {
+    pub name: String,
+    pub repos: String,
+    pub created_at: i64,
+    pub revoked: bool,
+    pub read_only: bool,
+}
+
+/// Per-trace summary for listings.
+#[derive(Debug, Clone, Default)]
+pub struct TraceStats {
+    pub checkpoints: u64,
+    pub last_checkpoint_at: Option<i64>,
+    /// Distinct checkpoint authors, sorted.
+    pub authors: Vec<String>,
+}
+
 pub fn hash_token(token: &str) -> String {
     blake3::hash(token.as_bytes()).to_hex().to_string()
 }
@@ -114,6 +152,15 @@ impl Store {
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "FULL")?;
         db.execute_batch(SCHEMA)?;
+        // Databases created before read-only tokens lack the column.
+        let has_read_only: bool = db.query_row(
+            "SELECT count(*) FROM pragma_table_info('tokens') WHERE name = 'read_only'",
+            [],
+            |r| r.get::<_, i64>(0).map(|n| n > 0),
+        )?;
+        if !has_read_only {
+            db.execute_batch("ALTER TABLE tokens ADD COLUMN read_only INTEGER NOT NULL DEFAULT 0")?;
+        }
         Ok(Self {
             db,
             dir: dir.to_path_buf(),
@@ -141,33 +188,44 @@ impl Store {
 
     // -- tokens -----------------------------------------------------------------
 
-    pub fn create_token(&self, name: &str, repos: &str) -> DbResult<String> {
+    pub fn create_token(&self, name: &str, repos: &str, read_only: bool) -> DbResult<String> {
         let token = format!("ghf_{}", ghf_proto::id::random_hex(32));
         self.db.execute(
-            "INSERT INTO tokens (hash, name, repos, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![hash_token(&token), name, repos, ghf_proto::id::now_ms()],
+            "INSERT INTO tokens (hash, name, repos, created_at, read_only) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![hash_token(&token), name, repos, ghf_proto::id::now_ms(), read_only],
         )?;
         Ok(token)
     }
 
-    /// Repositories a token may access (`*` for all), if valid.
-    pub fn token_scope(&self, token: &str) -> DbResult<Option<String>> {
+    /// A token's grants, if it is valid.
+    pub fn token(&self, token: &str) -> DbResult<Option<TokenInfo>> {
         Ok(self
             .db
             .query_row(
-                "SELECT repos FROM tokens WHERE hash = ?1 AND revoked = 0",
+                "SELECT repos, read_only FROM tokens WHERE hash = ?1 AND revoked = 0",
                 [hash_token(token)],
-                |r| r.get(0),
+                |r| {
+                    Ok(TokenInfo {
+                        repos: r.get(0)?,
+                        read_only: r.get::<_, i64>(1)? != 0,
+                    })
+                },
             )
             .optional()?)
     }
 
-    pub fn list_tokens(&self) -> DbResult<Vec<(String, String, i64, bool)>> {
-        let mut st = self
-            .db
-            .prepare("SELECT name, repos, created_at, revoked FROM tokens ORDER BY created_at")?;
+    pub fn list_tokens(&self) -> DbResult<Vec<TokenRow>> {
+        let mut st = self.db.prepare(
+            "SELECT name, repos, created_at, revoked, read_only FROM tokens ORDER BY created_at",
+        )?;
         let rows = st.query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? != 0))
+            Ok(TokenRow {
+                name: r.get(0)?,
+                repos: r.get(1)?,
+                created_at: r.get(2)?,
+                revoked: r.get::<_, i64>(3)? != 0,
+                read_only: r.get::<_, i64>(4)? != 0,
+            })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -287,7 +345,8 @@ impl Store {
         Ok(())
     }
 
-    fn tree(&self, repo: &str, id: &ObjectId) -> DbResult<Option<Vec<object::TreeEntry>>> {
+    /// Read a tree object.
+    pub fn tree(&self, repo: &str, id: &ObjectId) -> DbResult<Option<Vec<object::TreeEntry>>> {
         let Some(c) = self.read_object(repo, id)? else {
             return Ok(None);
         };
@@ -493,6 +552,70 @@ impl Store {
         let mut out = Vec::new();
         for r in rows {
             out.push(serde_json::from_str(&r?)?);
+        }
+        Ok(out)
+    }
+
+    pub fn checkpoint(&self, repo: &str, id: &str) -> DbResult<Option<CheckpointRecord>> {
+        let json: Option<String> = self
+            .db
+            .query_row(
+                "SELECT record FROM checkpoints WHERE repo = ?1 AND id = ?2",
+                params![repo, id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(match json {
+            Some(j) => Some(serde_json::from_str(&j)?),
+            None => None,
+        })
+    }
+
+    /// A trace's checkpoints in trace order.
+    pub fn trace_checkpoints(&self, repo: &str, trace_id: &str) -> DbResult<Vec<CheckpointRecord>> {
+        let mut st = self
+            .db
+            .prepare("SELECT record FROM checkpoints WHERE repo = ?1 AND trace_id = ?2")?;
+        let rows = st.query_map(params![repo, trace_id], |r| r.get::<_, String>(0))?;
+        let mut out: Vec<CheckpointRecord> = Vec::new();
+        for r in rows {
+            out.push(serde_json::from_str(&r?)?);
+        }
+        out.sort_by_key(|c| c.seq);
+        Ok(out)
+    }
+
+    /// Checkpoint count, latest checkpoint time and authors for every trace.
+    pub fn trace_stats(
+        &self,
+        repo: &str,
+    ) -> DbResult<std::collections::HashMap<String, TraceStats>> {
+        let mut st = self.db.prepare(
+            "SELECT trace_id, count(*), max(json_extract(record, '$.created_at')),
+                    json_group_array(DISTINCT json_extract(record, '$.author'))
+             FROM checkpoints WHERE repo = ?1 GROUP BY trace_id",
+        )?;
+        let rows = st.query_map([repo], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut out = std::collections::HashMap::new();
+        for r in rows {
+            let (id, n, last, authors) = r?;
+            let mut authors: Vec<String> = serde_json::from_str(&authors)?;
+            authors.sort();
+            out.insert(
+                id,
+                TraceStats {
+                    checkpoints: n as u64,
+                    last_checkpoint_at: last,
+                    authors,
+                },
+            );
         }
         Ok(out)
     }

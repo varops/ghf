@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Server
+
+- **Read-only tokens.** `ghf-server token create --read-only` creates a token that can read but not write. Uploads, trace and checkpoint pushes, holds, pending reports and prune refuse it with `E_AUTH`. `token list` shows each token's access. Existing tokens stay read-write.
+- **Web viewer.** `/ui` shows what agents tried, without installing ghf: each repository's traces, a checkpoint timeline with annotations (`tests=pass`/`fail` highlighted) and fork links, diffs between checkpoints, and files at a checkpoint. Sign in by pasting a token once; it is kept in an `HttpOnly`, `SameSite=Strict` cookie. Pages follow the token's repository scope, use stable URLs, support light and dark themes, and offer no write actions. See [Viewing traces in a browser](docs/server.md#viewing-traces-in-a-browser).
+
 ### Performance
 
 - **Faster edits.** A checkpoint after editing existing files reuses the last `git ls-files` listing, so it no longer starts git. Before reusing it, ghf checks the stamps (mtime, size, inode) on the listed directories, the index and the ignore files. A stamp less than 2 seconds old is never trusted, and the listing expires after 60 seconds.

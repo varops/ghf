@@ -58,7 +58,13 @@ ghf-server --data-dir /var/lib/ghf token revoke --name alice
 - `owner/*` matches every repository of an owner.
 - `*` matches everything.
 
-**Storage:** the server stores only a BLAKE3 hash of each token. `create` prints the token once.
+**Read-only tokens:** add `--read-only` to `token create`. Such a token can fetch objects, traces, checkpoints and policy, but every route that changes state refuses it with `E_AUTH`: object uploads (including `objects/missing`), trace and checkpoint pushes, holds, pending reports and prune. Use one for the browser viewer and for auditors. `git hf sync` needs a read-write token, because it reports pending traces on every run.
+
+```bash
+ghf-server --data-dir /var/lib/ghf token create --name audit --repos 'acme/*' --read-only
+```
+
+**Storage:** the server stores only a BLAKE3 hash of each token. `create` prints the token once. `token list` shows whether each token is `read-only` or `read-write`.
 
 **On clients,** set `GHF_TOKEN`, or run `echo "$TOKEN" | git hf login`. `login` saves the token to `~/.config/ghf/credentials.toml` with mode 0600.
 
@@ -90,6 +96,29 @@ ghf-server --data-dir /var/lib/ghf prune --dry-run
 ```
 
 **Garbage collection:** after pruning, objects that no retained checkpoint references are deleted. Objects younger than an hour are kept, because an upload may still be in flight. `GHF_GC_GRACE` changes that window, for example `GHF_GC_GRACE=10m`. Pruning never touches Git.
+
+## Viewing traces in a browser
+
+The server has a read-only web viewer at `/ui`, for example `https://ghf.example.com/ui`. It shows what agents tried:
+
+- **Repository:** every trace with its state, writers, checkpoint count, last activity and final commit.
+- **Trace:** a timeline of checkpoints with time, author, message, annotations and changed files. `tests=pass` and `tests=fail` are highlighted. Forks link to the checkpoint they started from.
+- **Diff:** a checkpoint against its parent, or any two checkpoints. Binary files are noted, not shown.
+- **Files:** the tree and any file as it was at a checkpoint.
+
+**Sign in** by pasting a token once. Create a read-only one for this. The browser keeps it in an `HttpOnly`, `SameSite=Strict` cookie for 30 days, marked `Secure` when the server terminates TLS or a proxy sends `X-Forwarded-Proto: https`. The viewer shows only the repositories the token's scope covers, and it has no write actions.
+
+**Links are stable** and safe to share with anyone who has a token for the repository:
+
+| Page | URL |
+|---|---|
+| Traces | `/ui/{owner}/{name}` |
+| Timeline | `/ui/{owner}/{name}/traces/{trace_id}` |
+| Checkpoint and its diff | `/ui/{owner}/{name}/checkpoints/{checkpoint_id}` |
+| Diff of two checkpoints | `/ui/{owner}/{name}/diff?from={a}&to={b}` |
+| File at a checkpoint | `/ui/{owner}/{name}/checkpoints/{checkpoint_id}/files/{path}` |
+
+Pruned checkpoints and their content are gone, so links to them return 404.
 
 ## API
 
