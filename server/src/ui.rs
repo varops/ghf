@@ -460,7 +460,7 @@ async fn repo_page(
                     "<tr><td><a href=\"{base}/traces/{}\">{}</a>{}{fork}</td><td>{}</td><td>{}</td>\
                      <td class=\"num\">{}</td><td>{}</td><td>{}</td></tr>",
                     enc(&t.id),
-                    esc(t.name.as_deref().unwrap_or(&t.id)),
+                    trace_label(t),
                     if t.name.is_some() {
                         format!("<div class=\"muted small\"><code>{}</code></div>", esc(&t.id))
                     } else {
@@ -482,7 +482,7 @@ async fn repo_page(
             }
             b.push_str("</tbody></table></div>");
         }
-        Ok(layout(&repo, &[(repo.clone(), None)], true, &b))
+        Ok(layout(&repo, &[(esc(&repo), None)], true, &b))
     })
     .await
 }
@@ -504,7 +504,7 @@ async fn trace_page(
         let cks = store.trace_checkpoints(&repo, &id)?;
         let base = repo_base(&repo);
         let title = t.name.clone().unwrap_or_else(|| t.id.clone());
-        let mut b = format!("<h1>Trace {}</h1>", esc(&title));
+        let mut b = format!("<h1>Trace {}</h1>", trace_label(&t));
 
         // Summary.
         b.push_str("<dl class=\"meta\">");
@@ -569,7 +569,7 @@ async fn trace_page(
                     b,
                     "<li><a href=\"{base}/traces/{}\">{}</a> from <code>{}</code> {}</li>",
                     enc(&f.id),
-                    esc(f.name.as_deref().unwrap_or(&f.id)),
+                    trace_label(f),
                     esc(f.forked_from.as_deref().unwrap_or("")),
                     state_badge(f)
                 );
@@ -616,8 +616,8 @@ async fn trace_page(
         Ok(layout(
             &format!("Trace {title}"),
             &[
-                (repo.clone(), Some(base.clone())),
-                (format!("trace {}", t.id), None),
+                (esc(&repo), Some(base.clone())),
+                (format!("trace <code>{}</code>", esc(&t.id)), None),
             ],
             true,
             &b,
@@ -791,9 +791,9 @@ async fn checkpoint_page(
 
 fn crumbs(repo: &str, base: &str, c: &CheckpointRecord) -> Vec<(String, Option<String>)> {
     vec![
-        (repo.to_owned(), Some(base.to_owned())),
+        (esc(repo), Some(base.to_owned())),
         (
-            format!("trace {}", c.trace_id),
+            format!("trace <code>{}</code>", esc(&c.trace_id)),
             Some(format!("{base}/traces/{}", enc(&c.trace_id))),
         ),
         (format!("#{}", c.seq), None),
@@ -849,7 +849,7 @@ async fn diff_page(
         b.push_str(&diff_html(store, &repo, &base, Some(&a), &c)?);
         Ok(layout(
             "Diff",
-            &[(repo.clone(), Some(base.clone())), ("diff".into(), None)],
+            &[(esc(&repo), Some(base.clone())), ("diff".into(), None)],
             true,
             &b,
         ))
@@ -1009,7 +1009,11 @@ async fn files(
         let mut cr = crumbs(&repo, &base, &c);
         cr.last_mut().expect("crumb").1 = Some(ck_url.clone());
         cr.push((
-            if path.is_empty() { "files".into() } else { path.clone() },
+            if path.is_empty() {
+                "files".into()
+            } else {
+                format!("<span class=\"path\">{}</span>", esc(&path))
+            },
             None,
         ));
         Ok(layout(
@@ -1271,6 +1275,7 @@ fn mode_word(m: Mode) -> &'static str {
 // ---------------------------------------------------------------------------
 // HTML helpers
 
+/// `crumbs` labels are HTML; callers escape them.
 fn layout(title: &str, crumbs: &[(String, Option<String>)], signed_in: bool, body: &str) -> String {
     let mut nav = String::from("<a href=\"/ui\">ghf</a>");
     for (label, href) in crumbs {
@@ -1278,15 +1283,13 @@ fn layout(title: &str, crumbs: &[(String, Option<String>)], signed_in: bool, bod
             Some(h) => {
                 let _ = write!(
                     nav,
-                    " <span aria-hidden=\"true\">/</span> <a href=\"{h}\">{}</a>",
-                    esc(label)
+                    " <span aria-hidden=\"true\">/</span> <a href=\"{h}\">{label}</a>"
                 );
             }
             None => {
                 let _ = write!(
                     nav,
-                    " <span aria-hidden=\"true\">/</span> <span aria-current=\"page\">{}</span>",
-                    esc(label)
+                    " <span aria-hidden=\"true\">/</span> <span aria-current=\"page\">{label}</span>"
                 );
             }
         }
@@ -1320,6 +1323,14 @@ fn state_badge(t: &TraceRecord) -> String {
         ""
     };
     format!("<span class=\"badge state-{s}\">{s}{extra}</span>")
+}
+
+/// A trace's name, or its id in monospace.
+fn trace_label(t: &TraceRecord) -> String {
+    match &t.name {
+        Some(n) => esc(n),
+        None => format!("<code>{}</code>", esc(&t.id)),
+    }
 }
 
 fn repo_base(repo: &str) -> String {
@@ -1444,6 +1455,7 @@ h3 { font-size: 1rem; margin: 0; }
 code, .path, .src, .hunk td, select {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .875rem;
 }
+h1 code { font-size: .9em; }
 .muted { color: var(--muted); }
 .small { font-size: .85rem; }
 .note { background: var(--note-bg); border: 1px solid var(--border); padding: .5rem .75rem; border-radius: 6px; }
