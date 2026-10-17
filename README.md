@@ -2,6 +2,9 @@
 
 **High-frequency source control for AI agents. Git-compatible by design.**
 
+> [!IMPORTANT]
+> ghf is an early preview, currently being tested in Cloop and Automaze Works. Anything can change before v1 is officially released, including commands, the `--json` schema, the server API and the storage format.
+
 ghf (Git High Frequency) saves the state of a worktree every time an agent finishes an edit. Each save is a **checkpoint**. The checkpoints for one unit of work form a **trace**. Any agent on any authorized machine can list, diff, restore, apply or fork a trace.
 
 ghf sits next to Git, not inside it. It writes nothing into commits, messages, refs, notes or the object database. Accepted work still lands as ordinary Git commits and pull requests, and plain Git users never need to know ghf exists.
@@ -160,3 +163,7 @@ cargo test            # unit tests plus the PRD §14 acceptance scenarios
 ```
 
 The acceptance suite in [`extension/tests/acceptance.rs`](extension/tests/acceptance.rs) runs every PRD scenario. It uses real Git repositories, a real `ghf-server` and simulated machines.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
