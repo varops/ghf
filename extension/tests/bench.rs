@@ -1,4 +1,4 @@
-//! Benchmark harness (PRD §9 "measurable benchmark harness", §11 targets).
+//! Benchmark harness for capture, sync and restore latency.
 //!
 //! Run with:
 //!   cargo test --release -p git-hf --test bench -- --ignored --nocapture

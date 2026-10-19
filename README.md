@@ -127,14 +127,14 @@ See [docs/cli.md](docs/cli.md) for every command, its data and every error code.
 
 Measured on a 2,000-file repository, release build, Apple Silicon laptop:
 
-| Metric | Result | PRD target |
+| Metric | Result | Target |
 |---|---|---|
 | Checkpoint after editing 1–3 existing files (200 edits) | p50 25 ms, p95 28 ms | p95 < 50 ms |
 | Checkpoint after creating a file | p50 42 ms, p95 45–51 ms | p95 < 50 ms (borderline) |
 | Sync of 250 checkpoints (about 2,000 objects, 0.7 MB) | 2.3 s | p95 < 5 s per sync |
 | Cross-machine restore | 0.6 s | p95 < 10 s |
 
-**Why creating a file is slower.** When files change but none are added, removed or renamed, ghf reuses its last `git ls-files` listing. It knows nothing was added or removed because the timestamps on the listed directories haven't changed. Creating a file changes that set, so ghf asks git again. It runs git in parallel with hashing, but on this machine starting git alone takes about 13 ms. The PRD treats these targets as proposals until M0 measures Cloop's real workloads.
+**Why creating a file is slower.** When files change but none are added, removed or renamed, ghf reuses its last `git ls-files` listing. It knows nothing was added or removed because the timestamps on the listed directories haven't changed. Creating a file changes that set, so ghf asks git again. It runs git in parallel with hashing, but on this machine starting git alone takes about 13 ms.
 
 Reproduce with:
 
@@ -152,17 +152,17 @@ To see where time goes in one capture, set `GHF_TIMING=1`.
 | [`server/`](server) | `ghf-server` | Canonical store for checkpoints and traces |
 | [`proto/`](proto) | `ghf-proto` | Shared object format, records, API types and error codes |
 | [`skills/ghf/`](skills/ghf) | | Agent skill; `git hf skill install` writes it |
-| [`docs/`](docs) | | [User guide](docs/guide.md), [CLI reference](docs/cli.md), [server guide](docs/server.md), concept and PRDs |
+| [`docs/`](docs) | | [User guide](docs/guide.md), [CLI reference](docs/cli.md), [server guide](docs/server.md) |
 
 ## Development
 
 ```bash
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
-cargo test            # unit tests plus the PRD §14 acceptance scenarios
+cargo test            # unit tests plus the end-to-end acceptance scenarios
 ```
 
-The acceptance suite in [`extension/tests/acceptance.rs`](extension/tests/acceptance.rs) runs every PRD scenario. It uses real Git repositories, a real `ghf-server` and simulated machines.
+The acceptance suite in [`extension/tests/acceptance.rs`](extension/tests/acceptance.rs) runs every acceptance scenario. It uses real Git repositories, a real `ghf-server` and simulated machines.
 
 ## License
 

@@ -1,4 +1,4 @@
-//! PRD §14 acceptance scenarios, run against real Git repositories and a
+//! End-to-end acceptance scenarios, run against real Git repositories and a
 //! real `ghf-server`.
 
 mod common;

@@ -1,5 +1,5 @@
 //! `ghf-server`: canonical store for ghf checkpoints and traces.
-//! One binary plus a data directory (PRD §9.12).
+//! One binary plus a data directory.
 
 mod http;
 mod prune;

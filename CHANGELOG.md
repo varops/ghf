@@ -85,7 +85,7 @@ On a 2,000-file repository, release build:
 
 ### Known limitations
 
-- Hooks see only the agent's own tool calls. Writes by other processes are picked up at the next checkpoint. There is no file watcher yet (PRD P2).
+- Hooks see only the agent's own tool calls. Writes by other processes are picked up at the next checkpoint. There is no file watcher yet.
 - The Git index (staged state) and submodules are not captured.
 - Linux and macOS only.
 - Detecting a copied directory relies on its path and the machine id. A cloned VM that keeps both paths unchanged should delete `~/.config/ghf/machine-id`.

@@ -1,4 +1,4 @@
-//! Prune eligibility (PRD §9.9). Pure functions shared by client and server.
+//! Prune eligibility. Pure functions shared by client and server.
 
 use serde::{Deserialize, Serialize};
 

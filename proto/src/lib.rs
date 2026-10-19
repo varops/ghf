@@ -1,7 +1,7 @@
 //! Shared ghf protocol types.
 //!
 //! The JSON envelope, error codes and exit codes are part of the public
-//! automation API (PRD §9.10). The object format, records and HTTP API types
+//! automation API (docs/cli.md). The object format, records and HTTP API types
 //! are shared by `git-hf` and `ghf-server`.
 
 pub mod api;
