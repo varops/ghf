@@ -261,10 +261,7 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     fn age(path: &Path, secs: u64) {
-        let f = fs::File::open(path).unwrap();
-        let t = SystemTime::now() - Duration::from_secs(secs);
-        f.set_times(fs::FileTimes::new().set_modified(t).set_accessed(t))
-            .unwrap();
+        crate::platform::set_times(path, SystemTime::now() - Duration::from_secs(secs)).unwrap();
     }
 
     /// Refresh the listing with every stamp under `dir` aged past the racy

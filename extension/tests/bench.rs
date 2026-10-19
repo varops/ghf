@@ -42,20 +42,19 @@ fn dir_bytes(p: &Path) -> u64 {
 /// Set every file and directory under `root` (except `.git`) to `ago` old.
 fn age_tree(root: &Path, ago: Duration) {
     let t = std::time::SystemTime::now() - ago;
-    let times = fs::FileTimes::new().set_modified(t).set_accessed(t);
-    fn walk(p: &Path, times: fs::FileTimes) {
+    fn walk(p: &Path, t: std::time::SystemTime) {
         for e in fs::read_dir(p).unwrap().flatten() {
             if e.file_name() == ".git" {
                 continue;
             }
             if e.file_type().unwrap().is_dir() {
-                walk(&e.path(), times);
+                walk(&e.path(), t);
             }
-            fs::File::open(e.path()).unwrap().set_times(times).unwrap();
+            git_hf::platform::set_times(&e.path(), t).unwrap();
         }
     }
-    walk(root, times);
-    fs::File::open(root).unwrap().set_times(times).unwrap();
+    walk(root, t);
+    git_hf::platform::set_times(root, t).unwrap();
 }
 
 /// Deterministic pseudo-random generator so runs are comparable.

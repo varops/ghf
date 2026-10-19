@@ -155,3 +155,23 @@ pub fn create_private(path: &Path) -> io::Result<fs::File> {
     }
     o.open(path)
 }
+
+/// Set a file's or directory's modification and access time. Windows can
+/// only open a directory handle with backup semantics.
+pub fn set_times(path: &Path, t: std::time::SystemTime) -> io::Result<()> {
+    let times = fs::FileTimes::new().set_modified(t).set_accessed(t);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?;
+        f.set_times(times)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::File::open(path)?.set_times(times)
+    }
+}
