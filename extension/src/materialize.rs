@@ -7,7 +7,6 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use ghf_proto::object::Mode;
@@ -140,17 +139,15 @@ pub fn materialize(
         let content = store.blob(&e.id)?;
         match e.mode {
             Mode::Symlink => {
-                use std::os::unix::ffi::OsStrExt;
                 let _ = fs::remove_file(&full);
-                std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&content), &full)
+                crate::platform::create_symlink(&content, &full)
                     .context(|| format!("create symlink {path}"))?;
             }
             Mode::File | Mode::Exec => {
                 let dir = full.parent().expect("file has parent");
                 let tmp = dir.join(format!(".ghf-tmp-{}", ghf_proto::id::random_hex(6)));
                 fs::write(&tmp, &content).context(|| format!("write {path}"))?;
-                let perm = if e.mode == Mode::Exec { 0o755 } else { 0o644 };
-                fs::set_permissions(&tmp, fs::Permissions::from_mode(perm))?;
+                crate::platform::set_executable(&tmp, e.mode == Mode::Exec)?;
                 if fs::symlink_metadata(&full).is_ok_and(|m| m.file_type().is_symlink()) {
                     fs::remove_file(&full)?;
                 }

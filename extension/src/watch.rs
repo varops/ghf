@@ -45,9 +45,7 @@ fn writer() -> String {
     {
         return w;
     }
-    let user = std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "unknown".into());
+    let user = crate::platform::user_name();
     format!("watch:{user}")
 }
 
@@ -99,11 +97,12 @@ pub fn run(ws: &Workspace, opts: &Options, display: &str) -> Result<()> {
             opts.debounce.as_millis()
         );
     }
-    let root = std::fs::canonicalize(&ws.repo.root).unwrap_or_else(|_| ws.repo.root.clone());
+    let root =
+        crate::platform::canonicalize(&ws.repo.root).unwrap_or_else(|_| ws.repo.root.clone());
     let git_dir =
-        std::fs::canonicalize(&ws.repo.git_dir).unwrap_or_else(|_| ws.repo.git_dir.clone());
-    let common =
-        std::fs::canonicalize(&ws.repo.common_dir).unwrap_or_else(|_| ws.repo.common_dir.clone());
+        crate::platform::canonicalize(&ws.repo.git_dir).unwrap_or_else(|_| ws.repo.git_dir.clone());
+    let common = crate::platform::canonicalize(&ws.repo.common_dir)
+        .unwrap_or_else(|_| ws.repo.common_dir.clone());
     let req = Request {
         writer: writer(),
         annotations: BTreeMap::from([("captured_by".into(), "watch".into())]),

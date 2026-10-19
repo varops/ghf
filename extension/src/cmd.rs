@@ -606,8 +606,7 @@ fn read_side(ws: &Workspace, side: &Side, path: &str, e: &FileEntry) -> Result<V
         Side::Worktree(_) => {
             let full = ws.repo.root.join(path);
             if e.mode == Mode::Symlink {
-                use std::os::unix::ffi::OsStrExt;
-                Ok(fs::read_link(full)?.as_os_str().as_bytes().to_vec())
+                Ok(crate::platform::read_link_bytes(&full)?)
             } else {
                 Ok(fs::read(full)?)
             }
@@ -790,7 +789,7 @@ fn restore_new_worktree(
         }
     };
     ws.repo.worktree_add(&path, &rev)?;
-    let path = fs::canonicalize(&path).unwrap_or(path);
+    let path = crate::platform::canonicalize(&path).unwrap_or(path);
     let new_repo = Repo::discover(&path)?;
     let new_ws = Workspace::with_config(new_repo, ws.cfg.clone())?;
     let target = scan::flatten(&ws.store, &ck.root)?;

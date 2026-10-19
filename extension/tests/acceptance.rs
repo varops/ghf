@@ -309,9 +309,13 @@ fn s07_restore_into_new_worktree() {
     fs::create_dir_all(work.join("src/deep")).unwrap();
     fs::write(work.join("src/deep/a.rs"), "one").unwrap();
     fs::write(work.join("run.sh"), "#!/bin/sh\n").unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(work.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
-    std::os::unix::fs::symlink("src/deep/a.rs", work.join("link")).unwrap();
+    // Exec bits and symlinks exist only on Unix.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(work.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("src/deep/a.rs", work.join("link")).unwrap();
+    }
     let first = checkpoint(&m, &work, &[]);
     fs::write(work.join("src/deep/a.rs"), "two").unwrap();
     fs::remove_file(work.join("run.sh")).unwrap();
@@ -328,18 +332,19 @@ fn s07_restore_into_new_worktree() {
         fs::read_to_string(dest.join("src/deep/a.rs")).unwrap(),
         "one"
     );
-    assert_eq!(
-        fs::metadata(dest.join("run.sh"))
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(dest.join("run.sh"))
             .unwrap()
             .permissions()
-            .mode()
-            & 0o111,
-        0o111
-    );
-    assert_eq!(
-        fs::read_link(dest.join("link")).unwrap().to_str().unwrap(),
-        "src/deep/a.rs"
-    );
+            .mode();
+        assert_eq!(mode & 0o111, 0o111);
+        assert_eq!(
+            fs::read_link(dest.join("link")).unwrap().to_str().unwrap(),
+            "src/deep/a.rs"
+        );
+    }
     assert_ne!(d["context"], m.hf(&work, &["status"]).ok()["context"]);
     assert_eq!(
         d["checkpoint"]["root"], first["root"],

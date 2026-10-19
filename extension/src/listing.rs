@@ -19,7 +19,6 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -59,9 +58,9 @@ fn now_ns() -> i64 {
 fn stamp(path: &Path) -> Stamp {
     match fs::symlink_metadata(path) {
         Ok(md) => Stamp {
-            mtime: md.mtime().saturating_mul(1_000_000_000) + md.mtime_nsec(),
+            mtime: crate::platform::mtime_ns(&md),
             size: md.len(),
-            ino: md.ino(),
+            ino: crate::platform::file_id(&md),
         },
         Err(_) => Stamp {
             mtime: -1,
@@ -82,8 +81,7 @@ fn sentinels(repo: &Repo) -> Vec<PathBuf> {
         repo.common_dir.join("info/exclude"),
         repo.common_dir.join("config"),
     ];
-    if let Ok(home) = std::env::var("HOME") {
-        let home = PathBuf::from(home);
+    if let Some(home) = crate::platform::home_dir() {
         v.push(home.join(".gitconfig"));
         v.push(home.join(".gitignore"));
         v.push(home.join(".config/git/ignore"));
@@ -287,7 +285,7 @@ mod tests {
     fn reuses_listing_until_the_file_set_changes() {
         let dir = std::env::temp_dir().join(format!("ghf-list-{}", ghf_proto::id::random_hex(4)));
         fs::create_dir_all(dir.join("a/b")).unwrap();
-        let dir = fs::canonicalize(dir).unwrap();
+        let dir = crate::platform::canonicalize(dir).unwrap();
         assert!(
             Command::new("git")
                 .arg("init")

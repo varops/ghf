@@ -78,7 +78,7 @@ fn context_path(repo: &Repo) -> PathBuf {
 fn load_or_create_context(repo: &Repo) -> Result<(WorktreeContext, Option<String>)> {
     let path = context_path(repo);
     let machine_id = config::machine_id()?;
-    let root = fs::canonicalize(&repo.root).unwrap_or_else(|_| repo.root.clone());
+    let root = crate::platform::canonicalize(&repo.root).unwrap_or_else(|_| repo.root.clone());
     let mut replaced = None;
     if let Ok(text) = fs::read_to_string(&path)
         && let Ok(ctx) = serde_json::from_str::<WorktreeContext>(&text)
@@ -153,6 +153,6 @@ pub fn default_writer() -> String {
     {
         return w;
     }
-    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
+    let user = crate::platform::user_name();
     format!("manual:{user}")
 }

@@ -10,6 +10,7 @@ mod git;
 mod hooks;
 mod listing;
 mod materialize;
+mod platform;
 mod refs;
 mod remote;
 mod scan;

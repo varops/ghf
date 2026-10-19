@@ -6,8 +6,6 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use ghf_proto::object::{self, Kind, Mode, TreeEntry};
@@ -97,7 +95,7 @@ enum Item {
 }
 
 fn mtime_ns(md: &fs::Metadata) -> i64 {
-    md.mtime().saturating_mul(1_000_000_000) + md.mtime_nsec()
+    crate::platform::mtime_ns(md)
 }
 
 pub fn scan(repo: &Repo, store: &Store, opts: &ScanOptions) -> Result<Snapshot> {
@@ -179,7 +177,7 @@ pub fn submodule_head(dir: &Path) -> Option<String> {
         return None;
     }
     let repo = Repo::discover(dir).ok()?;
-    if repo.root != fs::canonicalize(dir).ok()? {
+    if repo.root != crate::platform::canonicalize(dir).ok()? {
         return None;
     }
     repo.head()
@@ -221,7 +219,7 @@ fn scan_path(
     let mode = if ft.is_symlink() {
         Mode::Symlink
     } else if ft.is_file() {
-        if md.mode() & 0o111 != 0 {
+        if crate::platform::is_executable(&md) {
             Mode::Exec
         } else {
             Mode::File
@@ -265,7 +263,7 @@ fn scan_path(
         settled
             && c.size == md.len()
             && c.mtime == mtime
-            && c.ino == md.ino()
+            && c.ino == crate::platform::file_id(&md)
             && c.mode == mode
             && (!opts.persist || store.has_object(&c.id))
     });
@@ -278,7 +276,7 @@ fn scan_path(
         return Ok(Item::File(entry(c.id), None));
     }
     let content = if mode == Mode::Symlink {
-        fs::read_link(&full).map(|t| t.as_os_str().as_bytes().to_vec())
+        crate::platform::read_link_bytes(&full)
     } else {
         fs::read(&full)
     };
@@ -295,7 +293,7 @@ fn scan_path(
     let stat = (opts.persist && opts.context_id.is_some() && settled).then_some(StatEntry {
         size: md.len(),
         mtime,
-        ino: md.ino(),
+        ino: crate::platform::file_id(&md),
         mode,
         id,
     });

@@ -60,7 +60,7 @@ fn common_dir_of(git_dir: &Path) -> PathBuf {
     match fs::read_to_string(git_dir.join("commondir")) {
         Ok(t) => {
             let p = git_dir.join(t.trim());
-            fs::canonicalize(&p).unwrap_or(p)
+            crate::platform::canonicalize(&p).unwrap_or(p)
         }
         Err(_) => git_dir.to_path_buf(),
     }
@@ -110,7 +110,7 @@ impl Repo {
     /// submodules (`.git` files). Returns `None` for anything unusual so the
     /// caller can ask git itself.
     fn discover_fast(cwd: &Path) -> Option<Self> {
-        let start = fs::canonicalize(cwd).ok()?;
+        let start = crate::platform::canonicalize(cwd).ok()?;
         let mut dir = start.as_path();
         loop {
             let dotgit = dir.join(".git");
@@ -129,7 +129,7 @@ impl Repo {
                 Ok(md) if md.is_file() => {
                     let text = fs::read_to_string(&dotgit).ok()?;
                     let p = Path::new(text.trim().strip_prefix("gitdir:")?.trim());
-                    let git_dir = fs::canonicalize(dir.join(p)).ok()?;
+                    let git_dir = crate::platform::canonicalize(dir.join(p)).ok()?;
                     if !git_dir.join("HEAD").is_file() {
                         return None;
                     }
@@ -515,7 +515,10 @@ mod tests {
             &dir,
         );
         let w = Repo::discover_fast(&wt).unwrap();
-        assert_eq!(w.common_dir, fs::canonicalize(dir.join(".git")).unwrap());
+        assert_eq!(
+            w.common_dir,
+            crate::platform::canonicalize(dir.join(".git")).unwrap()
+        );
         assert_ne!(w.git_dir, w.common_dir);
         assert_eq!(w.head(), fast.head());
         fs::remove_dir_all(dir).unwrap();

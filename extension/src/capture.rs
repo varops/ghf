@@ -245,23 +245,11 @@ struct IndexCache {
 
 fn index_stamp(ws: &Workspace) -> Option<(i64, u64, u64)> {
     let md = std::fs::metadata(ws.repo.git_dir.join("index")).ok()?;
-    let mtime = md
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_nanos() as i64;
-    Some((mtime, md.len(), file_id(&md)))
-}
-
-#[cfg(unix)]
-fn file_id(md: &std::fs::Metadata) -> u64 {
-    std::os::unix::fs::MetadataExt::ino(md)
-}
-
-#[cfg(not(unix))]
-fn file_id(_md: &std::fs::Metadata) -> u64 {
-    0
+    Some((
+        crate::platform::mtime_ns(&md),
+        md.len(),
+        crate::platform::file_id(&md),
+    ))
 }
 
 /// What is staged in the Git index relative to HEAD, as ghf content. Only

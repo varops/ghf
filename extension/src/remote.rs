@@ -647,16 +647,15 @@ pub fn spawn_background(ws: &Workspace) {
         return;
     };
     let Ok(err) = out.try_clone() else { return };
-    use std::os::unix::process::CommandExt;
-    let _ = std::process::Command::new(exe)
-        .args(["sync", "--background"])
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["sync", "--background"])
         .current_dir(&ws.repo.root)
         .env("GHF_BACKGROUND", "1")
         .stdin(std::process::Stdio::null())
         .stdout(out)
-        .stderr(err)
-        .process_group(0)
-        .spawn();
+        .stderr(err);
+    crate::platform::detach(&mut cmd);
+    let _ = cmd.spawn();
 }
 
 /// Body of `git hf sync --background`: one runner at a time, repeat while

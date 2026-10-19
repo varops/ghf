@@ -242,23 +242,18 @@ pub fn user_dir() -> Result<PathBuf> {
     {
         return Ok(PathBuf::from(d).join("ghf"));
     }
-    let home = std::env::var("HOME").map_err(|_| err!(Config, "HOME is not set"))?;
-    Ok(PathBuf::from(home).join(".config").join("ghf"))
+    let home = crate::platform::home_dir()
+        .ok_or_else(|| err!(Config, "no home directory (HOME or USERPROFILE)"))?;
+    Ok(home.join(".config").join("ghf"))
 }
 
 fn write_private(path: &Path, contents: &str) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).context(|| format!("create {}", dir.display()))?;
     }
     let tmp = path.with_extension("tmp");
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)
-        .context(|| format!("write {}", tmp.display()))?;
+    let mut f =
+        crate::platform::create_private(&tmp).context(|| format!("write {}", tmp.display()))?;
     f.write_all(contents.as_bytes())?;
     f.sync_all()?;
     fs::rename(&tmp, path).context(|| format!("write {}", path.display()))?;

@@ -1,7 +1,5 @@
 //! Time-sortable identifiers: `<prefix>_<26 Crockford base32 chars>` (ULID layout).
 
-use std::fs::File;
-use std::io::Read;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const CHECKPOINT: &str = "ck";
@@ -14,10 +12,7 @@ const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
 
 /// Fill `buf` with OS randomness.
 pub fn random_bytes(buf: &mut [u8]) {
-    // Unix-only for now (Windows is P2).
-    File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(buf))
-        .expect("read /dev/urandom");
+    getrandom::fill(buf).expect("OS randomness is available");
 }
 
 pub fn now_ms() -> i64 {

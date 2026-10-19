@@ -30,23 +30,32 @@ fn server_bin() -> PathBuf {
                 .status()
                 .expect("build ghf-server");
             assert!(status.success(), "building ghf-server failed");
-            bin().parent().unwrap().join("ghf-server")
+            bin()
+                .parent()
+                .unwrap()
+                .join(format!("ghf-server{}", std::env::consts::EXE_SUFFIX))
         })
         .clone()
+}
+
+/// Canonical path without Windows' `\\?\` prefix (matches what ghf reports).
+pub fn canonical(p: &Path) -> PathBuf {
+    let c = fs::canonicalize(p).unwrap();
+    let s = c.to_string_lossy().into_owned();
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) => PathBuf::from(rest),
+        None => c,
+    }
 }
 
 pub fn tempdir(tag: &str) -> PathBuf {
     let base = std::env::var("GHF_TEST_TMP")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir());
-    let mut rand = [0u8; 6];
-    fs::File::open("/dev/urandom")
-        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut rand))
-        .unwrap();
-    let hex: String = rand.iter().map(|b| format!("{b:02x}")).collect();
+    let hex = ghf_proto::id::random_hex(6);
     let dir = base.join(format!("ghf-test-{tag}-{hex}"));
     fs::create_dir_all(&dir).unwrap();
-    fs::canonicalize(dir).unwrap()
+    canonical(&dir)
 }
 
 pub fn git(dir: &Path, args: &[&str]) -> String {

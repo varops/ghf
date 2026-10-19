@@ -154,9 +154,8 @@ pub const SKILL: &str = include_str!("../../skills/ghf/SKILL.md");
 /// Write the skill for Claude Code. Returns (path, changed).
 pub fn install_skill(scope: Scope, root: Option<&Path>) -> Result<(PathBuf, bool)> {
     let base = match scope {
-        Scope::User => std::env::var("HOME")
-            .map(PathBuf::from)
-            .map_err(|_| err!(Config, "HOME is not set"))?,
+        Scope::User => crate::platform::home_dir()
+            .ok_or_else(|| err!(Config, "no home directory (HOME or USERPROFILE)"))?,
         Scope::Project | Scope::Local => root
             .ok_or_else(|| err!(NotARepo, "not inside a Git worktree; use --scope user"))?
             .to_path_buf(),
@@ -182,9 +181,8 @@ pub enum Scope {
 
 pub fn settings_path(h: Harness, scope: Scope, root: &Path) -> Result<PathBuf> {
     let home = || {
-        std::env::var("HOME")
-            .map(PathBuf::from)
-            .map_err(|_| err!(Config, "HOME is not set"))
+        crate::platform::home_dir()
+            .ok_or_else(|| err!(Config, "no home directory (HOME or USERPROFILE)"))
     };
     Ok(match (h, scope) {
         (Harness::ClaudeCode, Scope::Project) => root.join(".claude/settings.json"),
