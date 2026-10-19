@@ -1,139 +1,525 @@
 <!doctype html>
 <html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ghf — high-frequency source control for AI agents</title>
-<meta name="description" content="ghf saves the state of a worktree every time an AI agent finishes an edit. Restore, diff, apply or fork any checkpoint on any machine. Git-compatible by design: it never writes into Git.">
-<meta property="og:title" content="ghf — high-frequency source control for AI agents">
-<meta property="og:description" content="Per-edit checkpoints for coding agents, shared across machines, without touching Git history.">
-<meta property="og:type" content="website">
-<link rel="icon" href="favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="style.css">
-</head>
-<body>
-<header class="nav">
-  <div class="wrap nav-inner">
-    <a class="brand" href="#top" aria-label="ghf home"><img src="favicon.svg" alt="" width="22" height="22"><span>ghf</span></a>
-    <nav aria-label="Primary">
-      <a href="#how">How it works</a>
-      <a href="#start">Quick start</a>
-      <a href="https://github.com/varops/ghf/blob/main/docs/guide.md">Docs</a>
-      <a class="gh" href="https://github.com/varops/ghf">GitHub</a>
-    </nav>
-  </div>
-</header>
 
-<main id="top">
-  <section class="hero wrap">
-    <p class="preview">Early preview · v0.1.0-rc.1 · being tested in Cloop and Automaze Works</p>
-    <h1>High-frequency source control for AI agents.</h1>
-    <p class="lead">ghf saves your worktree every time an agent finishes an edit. Restore, diff, apply or fork any of those states, on any machine. Git never knows it was there.</p>
-    <div class="cta">
-      <a class="btn primary" href="https://github.com/varops/ghf/blob/main/docs/guide.md">Read the guide</a>
-      <a class="btn" href="https://github.com/varops/ghf/releases">Download</a>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ghf — high-frequency source control for AI agents</title>
+  <meta name="description"
+    content="ghf saves the state of a worktree every time an AI agent finishes an edit. Restore, diff, apply or fork any checkpoint on any machine. Git-compatible by design: it never writes into Git.">
+  <meta property="og:title" content="ghf — high-frequency source control for AI agents">
+  <meta property="og:description"
+    content="Per-edit checkpoints for coding agents, shared across machines, without touching Git history.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://ghf.sh/">
+  <meta name="theme-color" content="#2b6fd6">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+  <a class="skip" href="#top">Skip to content</a>
+  <header class="nav">
+    <div class="wrap nav-inner">
+      <a class="brand" href="#top" aria-label="ghf home"><img src="favicon.svg" alt="" width="22"
+          height="22"><span>ghf</span></a>
+      <nav aria-label="Primary">
+        <a href="#problem">Why</a>
+        <a href="#how">How it works</a>
+        <a href="#agents">For agents</a>
+        <a href="#start">Quick start</a>
+        <a href="https://github.com/varops/ghf/blob/main/docs/guide.md">Docs</a>
+        <a class="gh" href="https://github.com/varops/ghf">GitHub</a>
+      </nav>
     </div>
-    <pre class="term" aria-label="Example terminal session"><code><span class="p">$</span> git hf trace log --annotation tests=pass
+  </header>
+
+  <main id="top">
+    <section class="hero wrap">
+      <p class="preview"><span class="dot" aria-hidden="true"></span>Early preview · v0.1.0-rc.1 · 15 Oct 2026</p>
+      <p class="eyebrow">High-frequency source control for AI agents</p>
+      <h1>Every agent edit, saved.<br><span class="hl">Git never knows it was there.</span></h1>
+      <p class="lead"><strong>ghf</strong> (Git High Frequency) checkpoints your worktree every time an agent finishes
+        an edit. Any authorized agent, on any machine, can go back to it: restore, diff, apply or fork. Your commits
+        stay exactly as they are.</p>
+      <div class="cta">
+        <a class="btn primary" href="https://github.com/varops/ghf">View ghf on GitHub</a>
+        <a class="btn" href="https://github.com/varops/ghf/blob/main/docs/guide.md">Read the guide</a>
+        <a class="btn" href="https://github.com/varops/ghf/releases">Download</a>
+      </div>
+      <ul class="facts" aria-label="Project facts">
+        <li>Rust</li>
+        <li>Apache 2.0</li>
+        <li>Linux and macOS</li>
+        <li>Claude Code and Cursor hooks</li>
+      </ul>
+
+      <figure class="history">
+        <svg class="hist hist-d" viewBox="0 36 1000 254" role="img" aria-labelledby="hist-title hist-desc">
+          <title id="hist-title">Git accepted history above, ghf working history below</title>
+          <desc id="hist-desc">Git holds two commits. Between them, ghf records a checkpoint after every agent edit in
+            one trace, marks one checkpoint tests=pass, and forks a second attempt into its own worktree and trace.
+            Nothing is written into Git.</desc>
+          <g class="rowlab"><text x="0" y="82" class="big">Git</text><text x="0" y="104" class="sub">accepted
+              history</text><text x="0" y="192" class="big acc">ghf</text><text x="0" y="214" class="sub">working
+              history</text></g>
+          <path class="boundary" d="M180 140H980" />
+          <g class="pill">
+            <rect x="690" y="127" width="194" height="26" rx="13" /><text x="787" y="145">nothing written into
+              Git</text>
+          </g>
+          <path class="gitline" d="M180 86H980" />
+          <path class="link" d="M200 96C200 160 206 196 220 196" />
+          <path class="link" d="M894 196C934 196 940 160 940 96" />
+          <path class="trace" d="M232 196H882" />
+          <path class="trace fork" d="M648 196C656 236 662 262 674 262H778" />
+          <g class="cks">
+            <circle class="ck" style="--i:0" cx="232" cy="196" r="5" />
+            <circle class="ck" style="--i:1" cx="258" cy="196" r="5" />
+            <circle class="ck" style="--i:2" cx="284" cy="196" r="5" />
+            <circle class="ck" style="--i:3" cx="310" cy="196" r="5" />
+            <circle class="ck" style="--i:4" cx="336" cy="196" r="5" />
+            <circle class="ck" style="--i:5" cx="362" cy="196" r="5" />
+            <circle class="ck" style="--i:6" cx="388" cy="196" r="5" />
+            <circle class="ck" style="--i:7" cx="414" cy="196" r="5" />
+            <circle class="ck" style="--i:8" cx="440" cy="196" r="5" />
+            <circle class="ck" style="--i:9" cx="466" cy="196" r="5" />
+            <circle class="ck" style="--i:10" cx="492" cy="196" r="5" />
+            <circle class="ck pass" style="--i:11" cx="518" cy="196" r="7.5" />
+            <circle class="ck" style="--i:12" cx="544" cy="196" r="5" />
+            <circle class="ck" style="--i:13" cx="570" cy="196" r="5" />
+            <circle class="ck" style="--i:14" cx="596" cy="196" r="5" />
+            <circle class="ck" style="--i:15" cx="622" cy="196" r="5" />
+            <circle class="ck" style="--i:16" cx="648" cy="196" r="5" />
+            <circle class="ck" style="--i:17" cx="674" cy="196" r="5" />
+            <circle class="ck" style="--i:18" cx="700" cy="196" r="5" />
+            <circle class="ck" style="--i:19" cx="726" cy="196" r="5" />
+            <circle class="ck" style="--i:20" cx="752" cy="196" r="5" />
+            <circle class="ck" style="--i:21" cx="778" cy="196" r="5" />
+            <circle class="ck" style="--i:22" cx="804" cy="196" r="5" />
+            <circle class="ck" style="--i:23" cx="830" cy="196" r="5" />
+            <circle class="ck" style="--i:24" cx="856" cy="196" r="5" />
+            <circle class="ck" style="--i:25" cx="882" cy="196" r="5" />
+            <circle class="ck fk" style="--i:17" cx="674" cy="262" r="4.5" />
+            <circle class="ck fk" style="--i:18" cx="700" cy="262" r="4.5" />
+            <circle class="ck fk" style="--i:19" cx="726" cy="262" r="4.5" />
+            <circle class="ck fk" style="--i:20" cx="752" cy="262" r="4.5" />
+            <circle class="ck fk" style="--i:21" cx="778" cy="262" r="4.5" />
+          </g>
+          <g class="passlab">
+            <path d="M518 182V168" />
+            <rect x="468" y="146" width="100" height="22" rx="5" /><text x="518" y="161">tests=pass</text>
+          </g>
+          <text class="note-l" x="796" y="259">fork: a second attempt,</text>
+          <text class="note-l dimmer" x="796" y="279">own worktree and trace</text>
+          <g class="commits">
+            <circle cx="200" cy="86" r="10" />
+            <circle cx="940" cy="86" r="10" />
+          </g>
+          <g class="clab"><text x="200" y="62">commit</text><text x="940" y="62">commit + PR</text></g>
+          <text class="note-c" x="410" y="236">checkpoint after every agent edit: one trace per unit of work</text>
+        </svg>
+        <svg class="hist hist-m" viewBox="0 10 360 228" role="img" aria-labelledby="histm-title">
+          <title id="histm-title">Git accepted history above, ghf working history below: a checkpoint after every agent
+            edit, one marked tests=pass, a forked second attempt, and nothing written into Git</title>
+          <g class="rowlab"><text x="0" y="56" class="big">Git</text><text x="0" y="156" class="big acc">ghf</text></g>
+          <path class="boundary" d="M44 96H352" />
+          <g class="pill">
+            <rect x="105" y="83" width="190" height="26" rx="13" /><text x="200" y="100">nothing written into Git</text>
+          </g>
+          <path class="gitline" d="M44 50H352" />
+          <path class="link" d="M60 58C60 120 62 150 63 150" />
+          <path class="link" d="M337 150C338 150 340 120 340 58" />
+          <path class="trace" d="M72 150H328" />
+          <path class="trace fork" d="M264 150C268 180 272 200 280 200H328" />
+          <g class="cks">
+            <circle class="ck" style="--i:0" cx="72" cy="150" r="4" />
+            <circle class="ck" style="--i:1" cx="88" cy="150" r="4" />
+            <circle class="ck" style="--i:2" cx="104" cy="150" r="4" />
+            <circle class="ck" style="--i:3" cx="120" cy="150" r="4" />
+            <circle class="ck" style="--i:4" cx="136" cy="150" r="4" />
+            <circle class="ck" style="--i:5" cx="152" cy="150" r="4" />
+            <circle class="ck pass" style="--i:6" cx="168" cy="150" r="6" />
+            <circle class="ck" style="--i:7" cx="184" cy="150" r="4" />
+            <circle class="ck" style="--i:8" cx="200" cy="150" r="4" />
+            <circle class="ck" style="--i:9" cx="216" cy="150" r="4" />
+            <circle class="ck" style="--i:10" cx="232" cy="150" r="4" />
+            <circle class="ck" style="--i:11" cx="248" cy="150" r="4" />
+            <circle class="ck" style="--i:12" cx="264" cy="150" r="4" />
+            <circle class="ck" style="--i:13" cx="280" cy="150" r="4" />
+            <circle class="ck" style="--i:14" cx="296" cy="150" r="4" />
+            <circle class="ck" style="--i:15" cx="312" cy="150" r="4" />
+            <circle class="ck" style="--i:16" cx="328" cy="150" r="4" />
+            <circle class="ck fk" style="--i:13" cx="280" cy="200" r="3.5" />
+            <circle class="ck fk" style="--i:14" cx="296" cy="200" r="3.5" />
+            <circle class="ck fk" style="--i:15" cx="312" cy="200" r="3.5" />
+            <circle class="ck fk" style="--i:16" cx="328" cy="200" r="3.5" />
+          </g>
+          <g class="passlab">
+            <path d="M168 143V136" />
+            <rect x="126" y="117" width="84" height="20" rx="5" /><text x="168" y="131">tests=pass</text>
+          </g>
+          <text class="note-c start" x="44" y="178">checkpoint after every agent edit</text>
+          <text class="note-l end" x="352" y="228">fork: a second attempt</text>
+          <g class="commits">
+            <circle cx="60" cy="50" r="8" />
+            <circle cx="340" cy="50" r="8" />
+          </g>
+          <g class="clab"><text x="60" y="28">commit</text><text x="340" y="28">commit + PR</text></g>
+        </svg>
+        <figcaption>
+          <span class="k"><i class="sw commit" aria-hidden="true"></i>Git: commits, branches, pull requests</span>
+          <span class="k"><i class="sw ck" aria-hidden="true"></i>ghf: a checkpoint after every agent edit</span>
+          <span class="k"><i class="sw pass" aria-hidden="true"></i><code>tests=pass</code> annotation</span>
+          <span class="k"><i class="sw fk" aria-hidden="true"></i>fork: a second attempt in its own worktree and
+            trace</span>
+        </figcaption>
+      </figure>
+    </section>
+
+    <section class="band" id="numbers" aria-labelledby="numbers-title">
+      <div class="wrap">
+        <h2 id="numbers-title" class="band-title">Fast enough to run on every edit</h2>
+        <dl class="stats">
+          <div>
+            <dt>Checkpoint p95 after editing files (p50 25 ms)</dt>
+            <dd>28<span>ms</span></dd>
+          </div>
+          <div>
+            <dt>Restore on another machine</dt>
+            <dd>0.6<span>s</span></dd>
+          </div>
+          <div>
+            <dt>Sync of 250 checkpoints, about 2,000 objects, 0.7 MB</dt>
+            <dd>2.3<span>s</span></dd>
+          </div>
+          <div>
+            <dt>Changes to Git commits, messages, refs, notes or object database</dt>
+            <dd>0</dd>
+          </div>
+        </dl>
+        <p class="band-note">Measured on a 2,000-file repository, release build, Apple Silicon laptop. The benchmark is
+          in the repo and reproducible with <code>cargo test --release</code>. <a href="#bench">Full numbers</a></p>
+      </div>
+    </section>
+
+    <section class="wrap problem" id="problem">
+      <p class="kicker">01 · The problem</p>
+      <h2 class="section">Agents make hundreds of edits between two commits. Most of them disappear forever.</h2>
+      <div class="cols">
+        <p class="wide">Git was built around human-sized decisions. Between commits, coding agents pass through the last
+          green state before a bad refactor, the approach that almost worked, the attempt another model was making. Then
+          it is gone.</p>
+        <ul class="pains">
+          <li><strong>Harness undo is local.</strong> It is tied to one session, and gone with the machine.</li>
+          <li><strong>WIP commits pollute history.</strong> They mix working history with accepted history.</li>
+          <li><strong>Agents can't pick up each other's state.</strong> With many agents on many machines, one cannot
+            continue from another's exact files.</li>
+          <li><strong>Humans can't see what was tried.</strong> A person taking an escalation has no record of the
+            attempts.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="wrap" id="how">
+      <p class="kicker">02 · How ghf works</p>
+      <h2 class="section">A layer below commits.<br>Git stays canonical and is only read.</h2>
+      <div class="split" aria-label="Where ghf fits">
+        <div>
+          <h3>Git</h3>
+          <p>holds accepted history: commits, branches, pull requests.</p>
+        </div>
+        <div class="accent">
+          <h3>ghf</h3>
+          <p>holds recoverable working history, with its own retention, permissions and sync.</p>
+        </div>
+        <div>
+          <h3>Nothing else changes</h3>
+          <p>No commits, trailers, notes or refs. Plain Git users never need to know ghf exists.</p>
+        </div>
+      </div>
+
+      <div class="concepts">
+        <article><span class="num" aria-hidden="true">1</span>
+          <h3>Checkpoints</h3>
+          <p>A complete, independently restorable worktree state, captured by Claude Code and Cursor hooks after each
+            tool call, or by <code>git hf checkpoint</code>.</p>
+        </article>
+        <article><span class="num" aria-hidden="true">2</span>
+          <h3>Traces</h3>
+          <p>The checkpoints for one unit of work. Any authorized agent can <strong>list</strong>,
+            <strong>diff</strong>, <strong>restore</strong>, <strong>apply</strong> or <strong>fork</strong> it.</p>
+        </article>
+        <article><span class="num" aria-hidden="true">3</span>
+          <h3>Its own lifecycle</h3>
+          <p>Traces close, finalize against the commit that landed, and are pruned 30 days later. Pins and holds keep
+            what matters. Pruning never touches Git.</p>
+        </article>
+      </div>
+
+      <div class="example">
+        <div class="example-text">
+          <h3>Back to the last green state in two commands</h3>
+          <p>Tests passed, then a later step broke them. Find the last checkpoint annotated <code>tests=pass</code> and
+            restore it. No WIP commit, and the restore is itself recorded as a checkpoint.</p>
+        </div>
+        <pre class="term"
+          aria-label="Example terminal session"><code><span class="p">$</span> git hf trace log --annotation tests=pass
 <span class="dim">#7    ck_01m5054dg9rkmmeasv0rcxd8x0  2026-10-15T16:08:12Z  2 change(s)  claude-code:s1  [tests=pass]</span>
 <span class="p">$</span> git hf trace restore ck_01m5054dg9rk --in-place
 <span class="ok">restored ck_01m5054dg9rkmmeasv0rcxd8x0 in place (2 written, 1 deleted); recorded as ck_01m5054dmjth7gspksqcfddsh0</span></code></pre>
-  </section>
+      </div>
+    </section>
 
-  <section class="split wrap" aria-label="Where ghf fits">
-    <div><h2>Git</h2><p>holds accepted history: commits, branches, pull requests.</p></div>
-    <div class="accent"><h2>ghf</h2><p>holds recoverable working history, with its own retention, permissions and sync.</p></div>
-    <div><h2>Nothing else changes</h2><p>No commits, trailers, notes or refs. Plain Git users never need to know ghf exists.</p></div>
-  </section>
+    <section class="wrap" id="uses">
+      <h2 class="section">What it does for an agent fleet</h2>
+      <div class="grid">
+        <article>
+          <h3>Roll back to last green</h3>
+          <p>Tests passed, then a later step broke them. Return to the last checkpoint annotated
+            <code>tests=pass</code>, without a WIP commit.</p>
+        </article>
+        <article>
+          <h3>Hand off between machines</h3>
+          <p>Another worker continues from the exact file state, uncommitted changes included.</p>
+        </article>
+        <article>
+          <h3>Fork an attempt</h3>
+          <p>Two models try different approaches from the same checkpoint, each in its own worktree and trace.</p>
+        </article>
+        <article>
+          <h3>Show a human what was tried</h3>
+          <p>When a run escalates, list the trace and diff any two points.</p>
+        </article>
+        <article>
+          <h3>Survive a crash</h3>
+          <p>A checkpoint is acknowledged only once it is durable locally. Sync catches up when the network returns.</p>
+        </article>
+        <article class="cta-card">
+          <h3>Try it on your fleet</h3>
+          <p>Open source, self-hosted, three steps to set up.</p><a class="btn primary" href="#start">Quick start</a>
+        </article>
+      </div>
+    </section>
 
-  <section class="wrap" id="uses">
-    <h2 class="section">What it does for an agent fleet</h2>
-    <div class="grid">
-      <article><h3>Roll back to last green</h3><p>Tests passed, then a later step broke them. Return to the last checkpoint annotated <code>tests=pass</code>, without a WIP commit.</p></article>
-      <article><h3>Hand off between machines</h3><p>Another worker continues from the exact file state, uncommitted changes included.</p></article>
-      <article><h3>Fork an attempt</h3><p>Two models try different approaches from the same checkpoint, each in its own worktree and trace.</p></article>
-      <article><h3>Show a human what was tried</h3><p>When a run escalates, list the trace and diff any two points.</p></article>
-      <article><h3>Survive a crash</h3><p>A checkpoint is acknowledged only once it is durable locally. Sync catches up when the network returns.</p></article>
-    </div>
-  </section>
+    <section class="wrap" id="architecture">
+      <h2 class="section">Where the pieces live</h2>
+      <figure class="diagram">
+        <svg viewBox="0 70 760 236" role="img" aria-labelledby="dia-title">
+          <title id="dia-title">ghf keeps working history beside Git, never inside it</title>
+          <defs>
+            <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6"
+              orient="auto-start-reverse">
+              <path d="M0 0L10 5L0 10z" class="mk" />
+            </marker>
+          </defs>
+          <g class="edges" fill="none">
+            <path d="M280 118H224" marker-end="url(#arrow)" />
+            <path d="M480 118H536" marker-start="url(#arrow)" marker-end="url(#arrow)" />
+            <path d="M124 222V186H340V154" marker-end="url(#arrow)" />
+            <path d="M420 154V222" marker-start="url(#arrow)" marker-end="url(#arrow)" />
+            <path d="M636 154V222" marker-end="url(#arrow)" />
+          </g>
+          <g class="box">
+            <rect x="24" y="82" width="200" height="72" rx="8" /><text x="124" y="106" class="name">Git
+              repository</text><text x="124" y="122">commits, refs, index</text><text x="124" y="138">ghf reads, never
+              writes</text>
+          </g>
+          <g class="box main">
+            <rect x="280" y="82" width="200" height="72" rx="8" /><text x="380" y="106" class="name">git hf
+              client</text><text x="380" y="122">scan, hash, checkpoint</text><text x="380" y="138">restore, apply,
+              fork</text>
+          </g>
+          <g class="box">
+            <rect x="536" y="82" width="200" height="72" rx="8" /><text x="636" y="106"
+              class="name">ghf-server</text><text x="636" y="122">tokens, sync API</text><text x="636" y="138">retention
+              and prune</text>
+          </g>
+          <g class="box">
+            <rect x="24" y="222" width="200" height="72" rx="8" /><text x="124" y="246" class="name">Agent
+              harness</text><text x="124" y="262">Claude Code, Cursor</text><text x="124" y="278">hooks after each tool
+              call</text>
+          </g>
+          <g class="box">
+            <rect x="280" y="222" width="200" height="72" rx="8" /><text x="380" y="246" class="name">Local store
+              (.git/ghf)</text><text x="380" y="262">SQLite: objects, traces</text><text x="380" y="278">one transaction
+              per checkpoint</text>
+          </g>
+          <g class="box">
+            <rect x="536" y="222" width="200" height="72" rx="8" /><text x="636" y="246" class="name">Another
+              machine</text><text x="636" y="262">git hf sync pulls traces</text><text x="636" y="278">restores into a
+              new worktree</text>
+          </g>
+          <g class="label"><text x="252" y="110">reads</text><text x="508" y="110">sync</text><text x="232"
+              y="178">calls git hf hook</text><text x="428" y="194" class="start">atomic writes</text><text x="644"
+              y="194" class="start">pull, fetch</text></g>
+        </svg>
+        <figcaption>Agent hooks call <code>git hf</code> after every edit. It writes checkpoints to its own store under
+          <code>.git/ghf</code> and syncs them to <code>ghf-server</code>, from which any other machine can restore. Git
+          itself is only read.</figcaption>
+      </figure>
+    </section>
 
-  <section class="wrap" id="how">
-    <h2 class="section">How it works</h2>
-    <figure class="diagram">
-      <svg viewBox="0 0 760 318" role="img" aria-labelledby="dia-title">
-        <title id="dia-title">ghf keeps working history beside Git, never inside it</title>
-        <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="mk"/></marker></defs>
-        <g class="edges" fill="none">
-          <path d="M280 118H224" marker-end="url(#arrow)"/>
-          <path d="M480 118H536" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
-          <path d="M124 222V186H340V154" marker-end="url(#arrow)"/>
-          <path d="M420 154V222" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
-          <path d="M636 154V222" marker-end="url(#arrow)"/>
-        </g>
-        <g class="box"><rect x="24" y="82" width="200" height="72" rx="8"/><text x="124" y="106" class="name">Git repository</text><text x="124" y="122">commits, refs, index</text><text x="124" y="138">ghf reads, never writes</text></g>
-        <g class="box main"><rect x="280" y="82" width="200" height="72" rx="8"/><text x="380" y="106" class="name">git hf client</text><text x="380" y="122">scan, hash, checkpoint</text><text x="380" y="138">restore, apply, fork</text></g>
-        <g class="box"><rect x="536" y="82" width="200" height="72" rx="8"/><text x="636" y="106" class="name">ghf-server</text><text x="636" y="122">tokens, sync API</text><text x="636" y="138">retention and prune</text></g>
-        <g class="box"><rect x="24" y="222" width="200" height="72" rx="8"/><text x="124" y="246" class="name">Agent harness</text><text x="124" y="262">Claude Code, Cursor</text><text x="124" y="278">hooks after each tool call</text></g>
-        <g class="box"><rect x="280" y="222" width="200" height="72" rx="8"/><text x="380" y="246" class="name">Local store (.git/ghf)</text><text x="380" y="262">SQLite: objects, traces</text><text x="380" y="278">one transaction per checkpoint</text></g>
-        <g class="box"><rect x="536" y="222" width="200" height="72" rx="8"/><text x="636" y="246" class="name">Another machine</text><text x="636" y="262">git hf sync pulls traces</text><text x="636" y="278">restores into a new worktree</text></g>
-        <g class="label"><text x="252" y="110">reads</text><text x="508" y="110">sync</text><text x="232" y="178">calls git hf hook</text><text x="428" y="194" class="start">atomic writes</text><text x="644" y="194" class="start">pull, fetch</text></g>
-      </svg>
-      <figcaption>Agent hooks call <code>git hf</code> after every edit. It writes checkpoints to its own store under <code>.git/ghf</code> and syncs them to <code>ghf-server</code>, from which any other machine can restore. Git itself is only read.</figcaption>
-    </figure>
+    <section class="wrap" id="safe">
+      <p class="kicker">Safe by default</p>
+      <h2 class="section">Restore never eats work.</h2>
+      <div class="grid two feat">
+        <article>
+          <h3><span class="ico" aria-hidden="true">↳</span>Restore goes to a new worktree</h3>
+          <p>Restore goes into a new worktree by default. In-place restore and apply refuse if anything uncaptured would
+            be lost.</p>
+        </article>
+        <article>
+          <h3><span class="ico" aria-hidden="true">⇄</span>Apply is all or nothing</h3>
+          <p>A conflict on any path means nothing is applied and the working tree is unchanged.</p>
+        </article>
+        <article>
+          <h3><span class="ico" aria-hidden="true">↺</span>Every restore is a checkpoint</h3>
+          <p>Going back is itself recorded in the trace, so a restore never erases where you were.</p>
+        </article>
+        <article>
+          <h3><span class="ico" aria-hidden="true">■</span>Every checkpoint is complete</h3>
+          <p>A checkpoint is the full worktree state, stored as content-addressed objects (BLAKE3, zstd). Each one
+            restores on its own, and unchanged directories are shared.</p>
+        </article>
+        <article>
+          <h3><span class="ico" aria-hidden="true">1</span>One writer per worktree</h3>
+          <p>Parallel agents use separate Git worktrees, each with its own trace. A second writer gets
+            <code>E_WRITER_LOCKED</code>.</p>
+        </article>
+        <article>
+          <h3><span class="ico" aria-hidden="true">∅</span>Nothing written into Git</h3>
+          <p>No commits, trailers, notes, refs or objects in Git. ghf keeps its own store under <code>.git/ghf</code>.
+          </p>
+        </article>
+      </div>
+    </section>
 
-    <div class="grid two">
-      <article><h3>Every checkpoint is complete</h3><p>A checkpoint is the full worktree state, stored as content-addressed objects (BLAKE3, zstd). Each one restores on its own, and unchanged directories are shared.</p></article>
-      <article><h3>Restore never eats work</h3><p>Restore goes into a new worktree by default. In-place restore and apply refuse if anything uncaptured would be lost, and every restore is itself a checkpoint.</p></article>
-      <article><h3>One writer per worktree</h3><p>Parallel agents use separate Git worktrees, each with its own trace. A second writer gets <code>E_WRITER_LOCKED</code>.</p></article>
-      <article><h3>Its own lifecycle</h3><p>Traces close, finalize against the commit that landed, and are pruned 30 days later. Pins and holds keep what matters. Pruning never touches Git.</p></article>
-    </div>
-  </section>
-
-  <section class="wrap" id="agents">
-    <h2 class="section">Built for agents to call</h2>
-    <p class="wide">Every command takes <code>--json</code> and returns one versioned envelope with stable error and exit codes. Nothing prompts in automation, and mutating commands accept an idempotency key.</p>
-    <pre class="term"><code>{"schema":"ghf/v1","command":"trace apply","ok":false,
+    <section class="wrap" id="agents">
+      <p class="kicker">Built for agents</p>
+      <h2 class="section">Built for agents to call</h2>
+      <div class="agents">
+        <div>
+          <p class="wide">Every command takes <code>--json</code> and returns one versioned envelope with stable error
+            and exit codes. Nothing prompts in automation, and mutating commands accept an idempotency key.</p>
+          <ul class="ticks">
+            <li>Versioned <code>--json</code> on every command</li>
+            <li>Stable error and exit codes</li>
+            <li>No prompts in automation</li>
+            <li>Idempotency keys for mutating commands</li>
+          </ul>
+        </div>
+        <pre class="term"><code>{"schema":"ghf/v1","command":"trace apply","ok":false,
  "error":{"code":"E_APPLY_CONFLICT","message":"1 conflicting path(s); the working tree is unchanged"},
  "data":{"applied":false,"conflicts":[{"path":"src/lib.rs","reason":"content changed on both sides"}]}}</code></pre>
-  </section>
+      </div>
+    </section>
 
-  <section class="wrap" id="start">
-    <h2 class="section">Quick start</h2>
-    <ol class="steps">
-      <li><h3>Run a server</h3><pre class="term"><code>ghf-server --data-dir /var/lib/ghf token create --name fleet --repos 'acme/*'
+    <section class="wrap" id="server">
+      <div class="server">
+        <div>
+          <p class="kicker">Self-hosted</p>
+          <h2 class="section">Your own ghf-server</h2>
+          <p class="wide">Every team runs its own <code>ghf-server</code>: one Rust binary plus a data directory, with
+            repository-scoped tokens.</p>
+        </div>
+        <ul class="ticks">
+          <li>One Rust binary plus a data directory</li>
+          <li>Repository-scoped tokens</li>
+          <li>Read-only web viewer of each trace's timeline, annotations, forks and diffs</li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="wrap" id="start">
+      <h2 class="section">Quick start</h2>
+      <ol class="steps">
+        <li>
+          <h3>Run a server</h3>
+          <pre class="term"><code>ghf-server --data-dir /var/lib/ghf token create --name fleet --repos 'acme/*'
 ghf-server --data-dir /var/lib/ghf serve --listen 0.0.0.0:7878 \
-  --tls-cert cert.pem --tls-key key.pem</code></pre></li>
-      <li><h3>Enable a repository</h3><pre class="term"><code>git hf init --server https://ghf.example.com --repository acme/project
-git add .ghf &amp;&amp; git commit -m "Enable ghf"</code></pre></li>
-      <li><h3>Set up each machine</h3><pre class="term"><code>git hf trust
+  --tls-cert cert.pem --tls-key key.pem</code></pre>
+        </li>
+        <li>
+          <h3>Enable a repository</h3>
+          <pre class="term"><code>git hf init --server https://ghf.example.com --repository acme/project
+git add .ghf &amp;&amp; git commit -m "Enable ghf"</code></pre>
+        </li>
+        <li>
+          <h3>Set up each machine</h3>
+          <pre class="term"><code>git hf trust
 echo "$GHF_TOKEN" | git hf login
 git hf hooks install claude-code   # or: cursor
-git hf skill install</code></pre></li>
-    </ol>
-    <p class="wide">That's it: every agent edit is now a checkpoint. The <a href="https://github.com/varops/ghf/blob/main/docs/guide.md">user guide</a> covers the rest.</p>
-  </section>
+git hf skill install</code></pre>
+        </li>
+      </ol>
+      <p class="wide">That's it: every agent edit is now a checkpoint. The <a
+          href="https://github.com/varops/ghf/blob/main/docs/guide.md">user guide</a> covers the rest.</p>
+    </section>
 
-  <section class="wrap" id="numbers">
-    <h2 class="section">Fast enough to run on every edit</h2>
-    <div class="table">
-      <table>
-        <thead><tr><th scope="col">2,000-file repository, release build</th><th scope="col">p50</th><th scope="col">p95</th></tr></thead>
-        <tbody>
-          <tr><td>Checkpoint after editing files</td><td>25 ms</td><td>28 ms</td></tr>
-          <tr><td>Checkpoint after creating a file</td><td>42 ms</td><td>45–51 ms</td></tr>
-          <tr><td>Restore on another machine</td><td colspan="2">0.6 s</td></tr>
-        </tbody>
-      </table>
-    </div>
-  </section>
+    <section class="wrap" id="bench">
+      <h2 class="section">The numbers in detail</h2>
+      <div class="table">
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">2,000-file repository, release build</th>
+              <th scope="col">p50</th>
+              <th scope="col">p95</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Checkpoint after editing files</td>
+              <td>25 ms</td>
+              <td>28 ms</td>
+            </tr>
+            <tr>
+              <td>Checkpoint after creating a file</td>
+              <td>42 ms</td>
+              <td>45–51 ms</td>
+            </tr>
+            <tr>
+              <td>Restore on another machine</td>
+              <td colspan="2">0.6 s</td>
+            </tr>
+            <tr>
+              <td>Sync of 250 checkpoints (about 2,000 objects, 0.7 MB)</td>
+              <td colspan="2">2.3 s</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="small">Measured on an Apple Silicon laptop. Reproduce with <code>cargo test --release</code>.</p>
+    </section>
 
-  <section class="wrap note" aria-label="Preview notice">
-    <p><strong>Early preview.</strong> ghf is currently being tested in Cloop and Automaze Works. Anything can change before v1 is officially released, including commands, the JSON schema, the server API and the storage format.</p>
-  </section>
-</main>
+    <section class="wrap final" aria-labelledby="final-title">
+      <div class="final-inner">
+        <h2 id="final-title">Give every agent edit a way back.</h2>
+        <p>Open source under Apache 2.0. Rust, Linux and macOS.</p>
+        <div class="cta">
+          <a class="btn primary" href="https://github.com/varops/ghf">View ghf on GitHub</a>
+          <a class="btn" href="https://github.com/varops/ghf/blob/main/docs/guide.md">Read the guide</a>
+        </div>
+      </div>
+    </section>
 
-<footer class="wrap foot">
-  <p>ghf is open source under the <a href="https://github.com/varops/ghf/blob/main/LICENSE">Apache License 2.0</a>.</p>
-  <p><a href="https://github.com/varops/ghf">GitHub</a> · <a href="https://github.com/varops/ghf/blob/main/docs/guide.md">User guide</a> · <a href="https://github.com/varops/ghf/blob/main/docs/cli.md">CLI reference</a> · <a href="https://github.com/varops/ghf/blob/main/docs/server.md">Server guide</a> · <a href="https://github.com/varops/ghf/blob/main/CHANGELOG.md">Changelog</a></p>
-</footer>
+    <section class="wrap note" aria-label="Preview notice">
+      <p><strong>Early preview.</strong> ghf is currently being tested in Cloop and Automaze Works. Anything can change
+        before v1 is officially released, including commands, the JSON schema, the server API and the storage format.
+      </p>
+    </section>
+  </main>
+
+  <footer class="wrap foot">
+    <p>ghf is open source under the <a href="https://github.com/varops/ghf/blob/main/LICENSE">Apache License 2.0</a>.
+    </p>
+    <p><a href="https://github.com/varops/ghf">GitHub</a> · <a
+        href="https://github.com/varops/ghf/blob/main/docs/guide.md">User guide</a> · <a
+        href="https://github.com/varops/ghf/blob/main/docs/cli.md">CLI reference</a> · <a
+        href="https://github.com/varops/ghf/blob/main/docs/server.md">Server guide</a> · <a
+        href="https://github.com/varops/ghf/blob/main/CHANGELOG.md">Changelog</a></p>
+  </footer>
 </body>
+
 </html>
