@@ -7,6 +7,7 @@
 - **`ghf` command.** The client also installs as `ghf`, the same program as `git hf`.
 - **`ghf watch`.** Checkpoints writes that no hook sees, such as generators, background processes and editors, after they settle. It records on behalf of the trace's current writer, marked `captured_by=watch`, and never takes the trace.
 - **Staged changes.** Each checkpoint records the Git index relative to its base revision, including partial staging. `trace restore --index` and `trace fork --index` restage it. That is the only time ghf writes to Git's index and object store, as `git add` would.
+- **Windows.** The client and server build and pass the full test suite on Windows, now part of CI. Without symlink privileges, symlinks restore as plain files holding the target, as Git for Windows does.
 - **Submodules.** Each submodule is recorded as the commit it has checked out. Restore moves a submodule to that commit only when it is checked out, clean and has the commit; otherwise it warns with the command to run.
 
 ### Changed

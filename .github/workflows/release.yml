@@ -25,7 +25,12 @@ jobs:
             cross: true
           - target: aarch64-apple-darwin
             os: macos-14
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -40,16 +45,28 @@ jobs:
       - name: Package
         run: |
           name=ghf-${GITHUB_REF_NAME}-${{ matrix.target }}
+          ext=""
+          case "${{ matrix.target }}" in *windows*) ext=".exe";; esac
           mkdir -p "dist/$name"
-          cp target/${{ matrix.target }}/release/git-hf target/${{ matrix.target }}/release/ghf target/${{ matrix.target }}/release/ghf-server "dist/$name/"
+          for b in git-hf ghf ghf-server; do
+            cp "target/${{ matrix.target }}/release/$b$ext" "dist/$name/"
+          done
           cp README.md CHANGELOG.md LICENSE "dist/$name/"
           cp -r skills docs "dist/$name/"
-          tar -C dist -czf "dist/$name.tar.gz" "$name"
-          shasum -a 256 "dist/$name.tar.gz" > "dist/$name.tar.gz.sha256"
+          cd dist
+          if [ -n "$ext" ]; then
+            7z a -tzip "$name.zip" "$name" > /dev/null
+            sha256sum "$name.zip" > "$name.zip.sha256"
+          else
+            tar -czf "$name.tar.gz" "$name"
+            shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: dist/*.tar.gz*
+          path: |
+            dist/*.tar.gz*
+            dist/*.zip*
 
   release:
     needs: build

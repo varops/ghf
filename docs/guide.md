@@ -59,7 +59,7 @@ Run it as `ghf`, or as `git hf`: Git finds `git-hf` on your `PATH`. Every exampl
 ghf --version
 ```
 
-You need Git 2.31 or later, on Linux or macOS.
+You need Git 2.31 or later, on Linux, macOS or Windows. On Windows, Git has no executable bit, and symlinks need Developer Mode (or administrator rights); without it, ghf writes a plain file holding the link target, as Git for Windows does.
 
 ## 3. Set up a server
 

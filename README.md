@@ -31,7 +31,7 @@ New here? Start with the [user guide](docs/guide.md).
 Requirements:
 
 - Git 2.31 or later.
-- Linux or macOS.
+- Linux, macOS or Windows.
 - Rust 1.89 or later, if you build from source.
 
 ```bash
