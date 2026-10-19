@@ -1,4 +1,4 @@
-# `git hf` reference
+# `ghf` reference
 
 Schema `ghf/v1`. This document is part of the public API. Fields may be added; existing fields and error codes keep their meaning.
 
@@ -40,7 +40,7 @@ The `hook` command is the one exception: it answers in the harness's own format.
 | `E_CAPTURE_FAILED` | 1 | Capture failed (strict mode surfaces this to the harness) |
 | `E_USAGE` | 2 | Invalid arguments or missing input |
 | `E_NOT_A_REPO` | 2 | Not inside a Git worktree |
-| `E_NOT_INITIALIZED` | 2 | No `.ghf`; run `git hf init` |
+| `E_NOT_INITIALIZED` | 2 | No `.ghf`; run `ghf init` |
 | `E_CONFIG` | 2 | Invalid `.ghf` or user configuration |
 | `E_AMBIGUOUS` | 2 | A reference prefix matches more than one item |
 | `E_WORKTREE_DIRTY` | 3 | Uncaptured changes would be lost; `data.paths` when ignored or skipped files are in the way |
@@ -52,7 +52,7 @@ The `hook` command is the one exception: it answers in the harness's own format.
 | `E_APPLY_CONFLICT` | 4 | Apply conflicts; `data.conflicts[]` of `{path, reason}`, `data.applied` |
 | `E_IDEMPOTENCY_CONFLICT` | 4 | Key reused with different arguments |
 | `E_NOT_SYNCED` | 5 | Checkpoints not yet on the server |
-| `E_UNTRUSTED_SERVER` | 5 | Server not trusted on this machine; run `git hf trust` |
+| `E_UNTRUSTED_SERVER` | 5 | Server not trusted on this machine; run `ghf trust` |
 | `E_AUTH` | 5 | Missing or rejected credentials |
 | `E_SERVER` | 5 | Server unreachable or failed |
 | `E_SERVER_MISMATCH` | 5 | Server identity changed since it was trusted |
@@ -84,13 +84,16 @@ The `hook` command is the one exception: it answers in the harness's own format.
  "root": "<manifest tree id>", "files": 2000, "bytes": 8192000,
  "message": "optional", "annotations": {"tests": "pass"},
  "changes": [{"path": "src/a.rs", "status": "modified"}, {"path": "b.rs", "status": "renamed", "from": "a.rs"}],
- "skipped": [{"path": "big.bin", "reason": "too_large", "size": 200000000}]}
+ "skipped": [{"path": "big.bin", "reason": "too_large", "size": 200000000}],
+ "index": {"staged": "<manifest tree id>", "removed": ["old.rs"]}}
 ```
 
 - **Times** are Unix milliseconds.
 - **`changes[].status`** is one of `added`, `modified`, `deleted`, `renamed` or `mode`.
 - **`changes`** compares the checkpoint with its parent. A trace's first checkpoint is compared with Git `HEAD` instead.
-- **`skipped[].reason`** is one of `too_large`, `non_utf8_path`, `unsafe_path`, `unreadable`, `submodule` or `special_file`.
+- **`skipped[].reason`** is one of `too_large`, `non_utf8_path`, `unsafe_path`, `unreadable`, `submodule_not_checked_out` or `special_file`.
+- **Submodules** appear in the manifest as gitlink entries holding the checked-out commit id.
+- **`index`** is present when something was staged: a manifest of staged additions and modifications (content as staged) and the paths staged for deletion, relative to `base_rev`. A change to the index alone is a new checkpoint.
 
 **Trace:**
 
@@ -180,7 +183,7 @@ Compares A with B, or A with the working tree if B is omitted.
 - **Data:** `{from, to, changes[], patch?}`. `--patch` includes a unified diff.
 - **Human output:** always the patch.
 
-### `trace restore ID [--worktree PATH]`
+### `trace restore ID [--worktree PATH] [--index]`
 
 Creates a new Git worktree (`git worktree add --detach` at the checkpoint's base revision) and writes the checkpoint's files. It also creates:
 - A new worktree context.
@@ -190,17 +193,24 @@ Creates a new Git worktree (`git worktree add --detach` at the checkpoint's base
 
 **Verification:** the result is checked to be byte-identical to the checkpoint.
 
-Data: `{worktree, base_rev, context, trace, checkpoint, restored_from, files_written, warnings[]}`.
+**Verification:** submodules are compared separately (below).
 
-### `trace restore ID --in-place [--force]`
+**`--index`** restages the checkpoint's staged changes: the index is reset to the base revision, then each staged entry is written into Git's object store and the index, as `git add` would. Without it, the index is left alone, and `warnings` says when the checkpoint had staged changes.
+
+**Submodules:** a submodule is moved to its recorded commit only if it is checked out, has no uncommitted changes and has that commit locally. ghf never fetches. Otherwise it is left as is, and `warnings` says what to run.
+
+Data: `{worktree, base_rev, context, trace, checkpoint, restored_from, files_written, restaged, warnings[]}`.
+
+### `trace restore ID --in-place [--force] [--index]`
 
 Runs only if the working tree matches the latest checkpoint of this worktree's open trace. Otherwise it fails with `E_WORKTREE_DIRTY`.
 
 - **`--force`** checkpoints first; that checkpoint's id is in `pre_restore_checkpoint`.
 - **Untouched:** files ghf did not capture are never touched. That covers ignored files, skipped files and anything else not in the scan. If the checkpoint needs one of those paths, the restore is refused with `E_WORKTREE_DIRTY` and `data.paths`, before anything changes.
+- **`--index`** also restages the checkpoint's staged changes. The index then has to match the latest checkpoint too, or the restore is refused.
 - **History:** the result is recorded as a new checkpoint.
 
-Data: `{restored_from, checkpoint, pre_restore_checkpoint, files_written, files_deleted}`.
+Data: `{restored_from, checkpoint, pre_restore_checkpoint, files_written, files_deleted, restaged, warnings[]}`.
 
 ### `trace apply A..B | A.. | ID [--write-conflicts]`
 
@@ -220,7 +230,7 @@ Data:
 {applied, from, to, checkpoint, pre_apply_checkpoint, files_written, files_deleted, conflicts[]}
 ```
 
-### `trace fork ID [--worktree PATH]`
+### `trace fork ID [--worktree PATH] [--index]`
 
 The same as `trace restore ID`, named for intent.
 
@@ -253,6 +263,16 @@ Data: `{dry_run, server, local}`.
 |---|---|---|
 | Claude Code | `.claude/settings.json` (`local`: `settings.local.json`; `user`: `~/.claude/settings.json`) | `PostToolUse` matching `Write\|Edit\|MultiEdit\|NotebookEdit\|Bash` |
 | Cursor | `.cursor/hooks.json` (`user`: `~/.cursor/hooks.json`) | `afterFileEdit`, `afterShellExecution` |
+
+### `watch [--debounce 2s] [--max-wait 30s]`
+
+Runs until interrupted. It checkpoints after file changes settle, catching writes that no hook sees: generators, background processes, an editor.
+
+- **On behalf of the writer.** When a writer holds the trace, checkpoints are recorded under that writer, annotated `captured_by=watch`. The watcher never claims or extends the writer's lease. With no writer, it records as `watch:<user>` or `$GHF_WRITER`.
+- **What it ignores.** Changes under `.git` are skipped, and a burst with no captured change records nothing.
+- **`--max-wait`** bounds how long continuous changes can postpone a checkpoint.
+
+With `--json`, it prints one envelope per checkpoint, one per line.
 
 ### `hook claude-code|cursor`
 

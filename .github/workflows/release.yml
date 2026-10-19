@@ -41,7 +41,7 @@ jobs:
         run: |
           name=ghf-${GITHUB_REF_NAME}-${{ matrix.target }}
           mkdir -p "dist/$name"
-          cp target/${{ matrix.target }}/release/git-hf target/${{ matrix.target }}/release/ghf-server "dist/$name/"
+          cp target/${{ matrix.target }}/release/git-hf target/${{ matrix.target }}/release/ghf target/${{ matrix.target }}/release/ghf-server "dist/$name/"
           cp README.md CHANGELOG.md LICENSE "dist/$name/"
           cp -r skills docs "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"

@@ -125,15 +125,39 @@ pub enum Mode {
     Exec,
     Symlink,
     Tree,
+    /// A submodule: the blob holds the checked-out commit id, as hex text.
+    Gitlink,
 }
 
 impl Mode {
+    /// The Git index mode for this entry kind.
+    pub fn git_mode(self) -> &'static str {
+        match self {
+            Mode::File => "100644",
+            Mode::Exec => "100755",
+            Mode::Symlink => "120000",
+            Mode::Tree => "040000",
+            Mode::Gitlink => "160000",
+        }
+    }
+
+    pub fn from_git_mode(s: &str) -> Self {
+        match s {
+            "100755" => Mode::Exec,
+            "120000" => Mode::Symlink,
+            "160000" => Mode::Gitlink,
+            "040000" => Mode::Tree,
+            _ => Mode::File,
+        }
+    }
+
     fn code(self) -> &'static str {
         match self {
             Mode::File => "f",
             Mode::Exec => "x",
             Mode::Symlink => "l",
             Mode::Tree => "t",
+            Mode::Gitlink => "g",
         }
     }
 
@@ -143,6 +167,7 @@ impl Mode {
             "x" => Mode::Exec,
             "l" => Mode::Symlink,
             "t" => Mode::Tree,
+            "g" => Mode::Gitlink,
             _ => return None,
         })
     }

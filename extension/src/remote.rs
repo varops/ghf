@@ -426,13 +426,19 @@ pub fn sync(ws: &Workspace, remote: &Remote) -> Result<SyncReport> {
     }
 
     for ck in ws.store.unsynced()? {
-        let mut sent = upload_closure(ws, remote, &ck.root, true, &mut report)?;
+        let mut sent = Vec::new();
+        for root in ck.roots() {
+            sent.extend(upload_closure(ws, remote, &root, true, &mut report)?);
+        }
         let mut result = remote.put_checkpoint(&ck);
         if matches!(&result, Err(f) if f.code == ErrorCode::ObjectMissing) {
             // The server lost objects we thought it had (pruned); stop
             // trusting the cache and check the whole closure.
             ws.store.forget_remote()?;
-            sent = upload_closure(ws, remote, &ck.root, false, &mut report)?;
+            sent.clear();
+            for root in ck.roots() {
+                sent.extend(upload_closure(ws, remote, &root, false, &mut report)?);
+            }
             result = remote.put_checkpoint(&ck);
         }
         match result {

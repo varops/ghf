@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Added
+
+- **`ghf` command.** The client also installs as `ghf`, the same program as `git hf`.
+- **`ghf watch`.** Checkpoints writes that no hook sees, such as generators, background processes and editors, after they settle. It records on behalf of the trace's current writer, marked `captured_by=watch`, and never takes the trace.
+- **Staged changes.** Each checkpoint records the Git index relative to its base revision, including partial staging. `trace restore --index` and `trace fork --index` restage it. That is the only time ghf writes to Git's index and object store, as `git add` would.
+- **Submodules.** Each submodule is recorded as the commit it has checked out. Restore moves a submodule to that commit only when it is checked out, clean and has the commit; otherwise it warns with the command to run.
+
+### Changed
+
+- Restoring the same checkpoint twice picks the next free default worktree name instead of failing.
+- Docs use `ghf` throughout. `git hf` works identically.
+
 ### Server
 
 - **Read-only tokens.** `ghf-server token create --read-only` creates a token that can read but not write. Uploads, trace and checkpoint pushes, holds, pending reports and prune refuse it with `E_AUTH`. `token list` shows each token's access. Existing tokens stay read-write.

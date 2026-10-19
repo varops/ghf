@@ -15,5 +15,7 @@ pub mod retention;
 pub use envelope::{ErrorBody, Response, SCHEMA_VERSION};
 pub use error::{ErrorCode, ExitCode};
 pub use object::ObjectId;
-pub use record::{Change, ChangeStatus, CheckpointRecord, Hold, Skipped, TraceRecord, TraceState};
+pub use record::{
+    Change, ChangeStatus, CheckpointRecord, Hold, IndexState, Skipped, TraceRecord, TraceState,
+};
 pub use retention::Policy;

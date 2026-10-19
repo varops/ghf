@@ -17,7 +17,7 @@ sqlite3 /var/lib/ghf/server.db ".backup /backups/ghf-$(date +%F).db"
 
 You can also stop the server and copy the directory. **Restore** by putting `server.db` and `server-id` back.
 
-**Keep `server-id` with the database.** If it changes, every client refuses to talk to the server (`E_SERVER_MISMATCH`) until someone runs `git hf trust` again.
+**Keep `server-id` with the database.** If it changes, every client refuses to talk to the server (`E_SERVER_MISMATCH`) until someone runs `ghf trust` again.
 
 ## Serve
 
@@ -58,7 +58,7 @@ ghf-server --data-dir /var/lib/ghf token revoke --name alice
 - `owner/*` matches every repository of an owner.
 - `*` matches everything.
 
-**Read-only tokens:** add `--read-only` to `token create`. Such a token can fetch objects, traces, checkpoints and policy, but every route that changes state refuses it with `E_AUTH`: object uploads (including `objects/missing`), trace and checkpoint pushes, holds, pending reports and prune. Use one for the browser viewer and for auditors. `git hf sync` needs a read-write token, because it reports pending traces on every run.
+**Read-only tokens:** add `--read-only` to `token create`. Such a token can fetch objects, traces, checkpoints and policy, but every route that changes state refuses it with `E_AUTH`: object uploads (including `objects/missing`), trace and checkpoint pushes, holds, pending reports and prune. Use one for the browser viewer and for auditors. `ghf sync` needs a read-write token, because it reports pending traces on every run.
 
 ```bash
 ghf-server --data-dir /var/lib/ghf token create --name audit --repos 'acme/*' --read-only
@@ -66,7 +66,7 @@ ghf-server --data-dir /var/lib/ghf token create --name audit --repos 'acme/*' --
 
 **Storage:** the server stores only a BLAKE3 hash of each token. `create` prints the token once. `token list` shows whether each token is `read-only` or `read-write`.
 
-**On clients,** set `GHF_TOKEN`, or run `echo "$TOKEN" | git hf login`. `login` saves the token to `~/.config/ghf/credentials.toml` with mode 0600.
+**On clients,** set `GHF_TOKEN`, or run `echo "$TOKEN" | ghf login`. `login` saves the token to `~/.config/ghf/credentials.toml` with mode 0600.
 
 ## Retention
 
@@ -88,7 +88,7 @@ ghf-server --data-dir /var/lib/ghf policy acme/api --after-finalize 14d --unfina
 
 **Prune runs:**
 - **Automatic:** the server prunes every hour. Change this with `--prune-interval`; `0s` disables it.
-- **By a client:** `git hf prune` runs it for that client's repository.
+- **By a client:** `ghf prune` runs it for that client's repository.
 - **By hand:**
 
 ```bash

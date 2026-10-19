@@ -113,6 +113,7 @@ fn mode_str(m: object::Mode) -> &'static str {
         object::Mode::Exec => "exec",
         object::Mode::Symlink => "symlink",
         object::Mode::Tree => "tree",
+        object::Mode::Gitlink => "gitlink",
     }
 }
 
@@ -121,6 +122,7 @@ fn parse_mode(s: &str) -> object::Mode {
         "exec" => object::Mode::Exec,
         "symlink" => object::Mode::Symlink,
         "tree" => object::Mode::Tree,
+        "gitlink" => object::Mode::Gitlink,
         _ => object::Mode::File,
     }
 }

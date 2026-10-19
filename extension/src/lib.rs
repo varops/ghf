@@ -1,4 +1,5 @@
-//! `git-hf`: Git discovers this binary as the `git hf` subcommand.
+//! The ghf client. Installed twice: as `ghf`, and as `git-hf` so Git runs
+//! it as `git hf`.
 
 mod capture;
 mod cli;
@@ -14,12 +15,13 @@ mod remote;
 mod scan;
 mod store;
 mod timing;
+mod watch;
 mod workspace;
 
 use std::process;
 
-use clap::Parser;
 use clap::error::ErrorKind;
+use clap::{CommandFactory, FromArgMatches};
 use ghf_proto::{ErrorCode, ExitCode, Response};
 use serde_json::json;
 
@@ -27,8 +29,27 @@ use cli::{Cli, Command, HooksCommand, SkillCommand, TraceCommand};
 use cmd::{Env, Out};
 use error::{Failure, Result};
 
-fn main() {
-    let cli = match Cli::try_parse() {
+/// How the user invoked us: `ghf`, or `git hf` (Git runs `git-hf`).
+fn display_name() -> &'static str {
+    let argv0 = std::env::args_os().next().unwrap_or_default();
+    match std::path::Path::new(&argv0)
+        .file_stem()
+        .and_then(|s| s.to_str())
+    {
+        Some("ghf") => "ghf",
+        _ => "git hf",
+    }
+}
+
+/// Entry point for both binaries.
+pub fn run() {
+    let display = display_name();
+    let parsed = Cli::command()
+        .name(display)
+        .bin_name(display)
+        .try_get_matches()
+        .and_then(|m| Cli::from_arg_matches(&m));
+    let cli = match parsed {
         Ok(cli) => cli,
         Err(err) => {
             let wants_json = std::env::args().any(|a| a == "--json");
@@ -48,6 +69,20 @@ fn main() {
     // Hooks answer in the harness's format, not the ghf envelope.
     if let Command::Hook { harness } = cli.command {
         process::exit(hooks::run(harness));
+    }
+
+    // The watcher runs until interrupted and reports one line per checkpoint.
+    if let Command::Watch { debounce, max_wait } = &cli.command {
+        let result = watch_main(cli.json, display, debounce, max_wait);
+        if let Err(f) = result {
+            if cli.json {
+                emit_json(&Response::err("watch", f.code, &f.message, f.data));
+            } else {
+                eprintln!("{display} watch: {} ({})", f.message, f.code);
+            }
+            process::exit(f.code.exit_code() as i32);
+        }
+        return;
     }
 
     let name = cli.command.name();
@@ -71,11 +106,33 @@ fn main() {
             if cli.json {
                 emit_json(&Response::err(name, f.code, &f.message, f.data));
             } else {
-                eprintln!("git hf {name}: {} ({})", f.message, f.code);
+                eprintln!("{display} {name}: {} ({})", f.message, f.code);
             }
             process::exit(f.code.exit_code() as i32);
         }
     }
+}
+
+fn watch_main(json: bool, display: &str, debounce: &str, max_wait: &str) -> Result<()> {
+    let ms = |s: &str| {
+        ghf_proto::retention::parse_duration_ms(s)
+            .filter(|ms| *ms > 0)
+            .map(|ms| std::time::Duration::from_millis(ms as u64))
+            .ok_or_else(|| {
+                Failure::new(
+                    ErrorCode::Usage,
+                    format!("invalid duration {s:?}; use e.g. 2s or 500ms"),
+                )
+            })
+    };
+    let opts = watch::Options {
+        debounce: ms(debounce)?,
+        max_wait: ms(max_wait)?,
+        json,
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let ws = workspace::Workspace::open(&cwd)?;
+    watch::run(&ws, &opts, display)
 }
 
 /// Run a mutating command at most once per key. A replay returns the
@@ -152,7 +209,7 @@ fn dispatch(env: &Env, command: &Command) -> Result<Out> {
         Command::Trust { url } => cmd::trust(env, url.clone()),
         Command::Login { server } => cmd::login(env, server.clone()),
         Command::Prune { dry_run } => cmd::prune(env, *dry_run),
-        Command::Hook { .. } => unreachable!("handled in main"),
+        Command::Hook { .. } | Command::Watch { .. } => unreachable!("handled in main"),
         Command::Skill(SkillCommand::Show) => Ok(Out {
             human: hooks::SKILL.trim_end().to_owned(),
             data: json!({"skill": hooks::SKILL}),
@@ -207,6 +264,7 @@ fn dispatch(env: &Env, command: &Command) -> Result<Out> {
                 target.worktree.clone(),
                 target.in_place,
                 target.force,
+                target.index,
             ),
             TraceCommand::Apply {
                 range,
@@ -215,7 +273,8 @@ fn dispatch(env: &Env, command: &Command) -> Result<Out> {
             TraceCommand::Fork {
                 checkpoint,
                 worktree,
-            } => cmd::trace_fork(env, checkpoint.clone(), worktree.clone()),
+                index,
+            } => cmd::trace_fork(env, checkpoint.clone(), worktree.clone(), *index),
             TraceCommand::Close { trace } => cmd::trace_close(env, trace.clone()),
             TraceCommand::Finalize {
                 trace,

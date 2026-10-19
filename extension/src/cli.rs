@@ -94,6 +94,15 @@ pub enum Command {
     /// Install or remove automatic capture hooks for an agent harness.
     #[command(subcommand)]
     Hooks(HooksCommand),
+    /// Checkpoint after file changes no hook sees (generators, editors, other processes).
+    Watch {
+        /// Quiet period after the last change before a checkpoint, e.g. 2s or 500ms.
+        #[arg(long, default_value = "2s")]
+        debounce: String,
+        /// Longest continuous changes may delay a checkpoint.
+        #[arg(long, default_value = "30s")]
+        max_wait: String,
+    },
     /// Hook entry point called by an agent harness (reads its payload on stdin).
     Hook { harness: Harness },
     /// Install or print the agent skill that teaches ghf workflows.
@@ -160,6 +169,9 @@ pub enum TraceCommand {
         checkpoint: String,
         #[arg(long)]
         worktree: Option<PathBuf>,
+        /// Also restage the checkpoint's staged changes.
+        #[arg(long)]
+        index: bool,
     },
     /// Mark a trace closed (default: this worktree's open trace).
     Close { trace: Option<String> },
@@ -207,6 +219,10 @@ pub struct RestoreTarget {
     /// With --in-place: checkpoint the current state first, then restore.
     #[arg(long, requires = "in_place")]
     pub force: bool,
+    /// Also restage the checkpoint's staged changes (writes them into the
+    /// Git index and object store, as `git add` would).
+    #[arg(long)]
+    pub index: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -243,6 +259,7 @@ impl Command {
             Self::Login { .. } => "login",
             Self::Prune { .. } => "prune",
             Self::Hook { .. } => "hook",
+            Self::Watch { .. } => "watch",
             Self::Skill(SkillCommand::Install { .. }) => "skill install",
             Self::Skill(SkillCommand::Show) => "skill show",
             Self::Hooks(h) => match h {
@@ -273,6 +290,7 @@ impl Command {
             self,
             Self::Status
                 | Self::Hook { .. }
+                | Self::Watch { .. }
                 | Self::Skill(SkillCommand::Show)
                 | Self::Hooks(HooksCommand::Status { .. })
                 | Self::Trace(

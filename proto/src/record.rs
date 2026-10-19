@@ -152,4 +152,28 @@ pub struct CheckpointRecord {
     pub changes: Vec<Change>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<Skipped>,
+    /// Staged changes (the Git index relative to `base_rev`), when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<IndexState>,
+}
+
+/// What was staged at capture time, relative to `base_rev`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexState {
+    /// Manifest tree of staged additions and modifications (content as staged).
+    pub staged: ObjectId,
+    /// Paths staged for deletion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed: Vec<String>,
+}
+
+impl CheckpointRecord {
+    /// Every manifest root this checkpoint needs to be restorable.
+    pub fn roots(&self) -> Vec<ObjectId> {
+        let mut v = vec![self.root];
+        if let Some(i) = &self.index {
+            v.push(i.staged);
+        }
+        v
+    }
 }

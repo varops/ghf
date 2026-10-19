@@ -9,6 +9,17 @@ use std::process::{Command, Stdio};
 use crate::error::Result;
 use crate::{err, fail};
 
+/// One staged change from `git diff --cached --raw`.
+#[derive(Debug, Clone)]
+pub struct StagedEntry {
+    pub path: String,
+    /// Git mode of the staged entry, e.g. `100644`, `100755`, `120000`, `160000`.
+    pub mode: String,
+    /// Object id of the staged content (a commit id for submodules).
+    pub oid: String,
+    pub deleted: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Repo {
     /// Worktree root.
@@ -270,6 +281,162 @@ impl Repo {
                 String::from_utf8_lossy(&out.stderr).trim()
             ),
         }
+    }
+
+    /// Staged changes: the index compared with HEAD (or the empty tree on an
+    /// unborn branch).
+    pub fn staged(&self) -> Result<Vec<StagedEntry>> {
+        let out = self.run([
+            "-c",
+            "core.quotepath=off",
+            "diff",
+            "--cached",
+            "--raw",
+            "-z",
+            "--no-renames",
+            "--no-abbrev",
+            "--ignore-submodules=none",
+        ])?;
+        let mut v = Vec::new();
+        let mut parts = out.split(|b| *b == 0).filter(|p| !p.is_empty());
+        while let (Some(meta), Some(path)) = (parts.next(), parts.next()) {
+            let meta = String::from_utf8_lossy(meta);
+            let f: Vec<&str> = meta.trim_start_matches(':').split(' ').collect();
+            if f.len() < 5 {
+                continue;
+            }
+            v.push(StagedEntry {
+                path: String::from_utf8_lossy(path).into_owned(),
+                mode: f[1].to_owned(),
+                oid: f[3].to_owned(),
+                deleted: f[4].starts_with('D'),
+            });
+        }
+        Ok(v)
+    }
+
+    /// Contents of Git blobs, by object id, via one `git cat-file --batch`.
+    pub fn cat_blobs(&self, oids: &[String]) -> Result<Vec<Vec<u8>>> {
+        use std::io::{BufRead, BufReader, Read, Write};
+        if oids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut child = self
+            .git()
+            .args(["cat-file", "--batch"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| err!(Internal, "cannot run git: {e}"))?;
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        let input: String = oids.iter().map(|o| format!("{o}\n")).collect();
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(input.as_bytes());
+        });
+        let mut out = BufReader::new(child.stdout.take().expect("piped stdout"));
+        let mut blobs = Vec::with_capacity(oids.len());
+        for oid in oids {
+            let mut header = String::new();
+            out.read_line(&mut header)?;
+            let size: usize = header
+                .split_whitespace()
+                .nth(2)
+                .and_then(|n| n.parse().ok())
+                .ok_or_else(|| err!(Internal, "git cat-file has no object {oid}"))?;
+            let mut buf = vec![0u8; size + 1];
+            out.read_exact(&mut buf)?;
+            buf.pop();
+            blobs.push(buf);
+        }
+        let _ = writer.join();
+        let _ = child.wait();
+        Ok(blobs)
+    }
+
+    /// Reset the index to `rev`'s tree without touching the working tree.
+    pub fn read_tree(&self, rev: &str) -> Result<()> {
+        self.run(["read-tree", rev]).map(|_| ())
+    }
+
+    /// Stage content directly in the index, as `git add` would: write each
+    /// blob into Git's object store, then point the index entries at them.
+    /// `entries` are (path, git mode, content); `removed` are unstaged deletions.
+    pub fn stage(
+        &self,
+        entries: &[(String, String, Vec<u8>)],
+        removed: &[String],
+        tmp: &Path,
+    ) -> Result<()> {
+        use std::io::Write;
+        // Submodule entries already name their commit; other content is
+        // written into Git's object store first.
+        let blobs: Vec<&(String, String, Vec<u8>)> =
+            entries.iter().filter(|(_, m, _)| m != "160000").collect();
+        let mut files = Vec::new();
+        for (i, (_, _, content)) in blobs.iter().enumerate() {
+            let p = tmp.join(format!("stage-{}-{i}", ghf_proto::id::random_hex(4)));
+            fs::write(&p, content)?;
+            files.push(p);
+        }
+        let blob_oids: Vec<String> = if files.is_empty() {
+            Vec::new()
+        } else {
+            let mut child = self
+                .git()
+                .args(["hash-object", "-w", "--no-filters", "--stdin-paths"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .map_err(|e| err!(Internal, "cannot run git: {e}"))?;
+            let list: String = files.iter().map(|p| format!("{}\n", p.display())).collect();
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(list.as_bytes())?;
+            let out = child.wait_with_output()?;
+            for f in &files {
+                let _ = fs::remove_file(f);
+            }
+            if !out.status.success() {
+                fail!(Internal, "git hash-object failed");
+            }
+            text(out.stdout).lines().map(str::to_owned).collect()
+        };
+        let mut blob_oids = blob_oids.into_iter();
+        let mut info = String::new();
+        let mut oid_len = 40;
+        for (path, mode, content) in entries {
+            let oid = if mode == "160000" {
+                String::from_utf8_lossy(content).trim().to_owned()
+            } else {
+                blob_oids
+                    .next()
+                    .ok_or_else(|| err!(Internal, "git hash-object returned too few ids"))?
+            };
+            oid_len = oid.len();
+            info.push_str(&format!("{mode} {oid}\t{path}\n"));
+        }
+        let zero = "0".repeat(oid_len);
+        for path in removed {
+            info.push_str(&format!("0 {zero}\t{path}\n"));
+        }
+        let mut child = self
+            .git()
+            .args(["update-index", "--index-info"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .map_err(|e| err!(Internal, "cannot run git: {e}"))?;
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(info.as_bytes())?;
+        if !child.wait()?.success() {
+            fail!(Internal, "git update-index failed");
+        }
+        Ok(())
     }
 
     /// Paths changed relative to HEAD (`git status`), used for the first

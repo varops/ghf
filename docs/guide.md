@@ -28,7 +28,7 @@ You can do four things with a checkpoint:
 
 Checkpoints sync to a ghf server, so another machine can restore them too.
 
-ghf never writes into Git. Your commits, branches, refs and history are exactly what they would be without it. Finished work still lands as normal commits and pull requests, and teammates who don't use ghf see nothing different.
+ghf never writes into Git history. Your commits, branches, refs and history are exactly what they would be without it. Finished work still lands as normal commits and pull requests, and teammates who don't use ghf see nothing different.
 
 | Term | Meaning |
 |---|---|
@@ -40,11 +40,11 @@ ghf never writes into Git. Your commits, branches, refs and history are exactly 
 
 ## 2. Install
 
-Download the archive for your platform from [Releases](https://github.com/varops/ghf/releases). Each archive holds two binaries, `git-hf` and `ghf-server`. Put them on your `PATH`:
+Download the archive for your platform from [Releases](https://github.com/varops/ghf/releases). Each archive holds the client as `ghf` and `git-hf` (the same program under two names) plus `ghf-server`. Put them on your `PATH`:
 
 ```bash
 tar -xzf ghf-v0.1.0-rc.1-aarch64-apple-darwin.tar.gz
-sudo cp ghf-v0.1.0-rc.1-aarch64-apple-darwin/git-hf ghf-v0.1.0-rc.1-aarch64-apple-darwin/ghf-server /usr/local/bin/
+sudo cp ghf-v0.1.0-rc.1-aarch64-apple-darwin/{ghf,git-hf,ghf-server} /usr/local/bin/
 ```
 
 Or build from source with Rust 1.89 or later:
@@ -53,10 +53,10 @@ Or build from source with Rust 1.89 or later:
 cargo install --git https://github.com/varops/ghf git-hf ghf-server
 ```
 
-Git finds `git-hf` on your `PATH` and runs it as `git hf`. Check the install:
+Run it as `ghf`, or as `git hf`: Git finds `git-hf` on your `PATH`. Every example in this guide works either way. Check the install:
 
 ```bash
-git hf --version
+ghf --version
 ```
 
 You need Git 2.31 or later, on Linux or macOS.
@@ -85,7 +85,7 @@ Do this once per repository:
 
 ```bash
 cd ~/src/project
-git hf init --server https://ghf.example.com --repository acme/project
+ghf init --server https://ghf.example.com --repository acme/project
 git add .ghf
 git commit -m "Enable ghf"
 ```
@@ -107,11 +107,11 @@ secrets/
 On every machine that runs agents, inside a clone of the repository:
 
 ```bash
-git hf trust                       # approve the server for uploads from this machine
-echo "$GHF_TOKEN" | git hf login   # or export GHF_TOKEN in the agent's environment
-git hf hooks install claude-code   # automatic capture (or: cursor)
-git hf skill install               # teach the agent how to use ghf
-git hf status
+ghf trust                       # approve the server for uploads from this machine
+echo "$GHF_TOKEN" | ghf login   # or export GHF_TOKEN in the agent's environment
+ghf hooks install claude-code   # automatic capture (or: cursor)
+ghf skill install               # teach the agent how to use ghf
+ghf status
 ```
 
 What each command does:
@@ -123,7 +123,7 @@ What each command does:
   - Use `--scope local` for `.claude/settings.local.json` or `--scope user` for your home directory.
 - **`skill install`** writes `.claude/skills/ghf/SKILL.md`.
 
-`git hf status` should show the server as trusted and report no warnings.
+`ghf status` should show the server as trusted and report no warnings.
 
 ## 6. Everyday use
 
@@ -132,17 +132,17 @@ With hooks installed, there is nothing to do: every file edit and shell command 
 Take one yourself after work the hooks can't see, or to mark a meaningful state:
 
 ```bash
-git hf checkpoint -m "parser handles nested quotes" --annotate tests=pass
+ghf checkpoint -m "parser handles nested quotes" --annotate tests=pass
 ```
 
 Look around:
 
 ```bash
-git hf status              # this worktree's trace, sync state, warnings
-git hf trace log           # its checkpoints, newest last
-git hf trace list          # every trace, including other machines' after a sync
-git hf trace diff @~3 @    # what changed over the last three checkpoints
-git hf trace diff @        # the working tree against the latest checkpoint
+ghf status              # this worktree's trace, sync state, warnings
+ghf trace log           # its checkpoints, newest last
+ghf trace list          # every trace, including other machines' after a sync
+ghf trace diff @~3 @    # what changed over the last three checkpoints
+ghf trace diff @        # the working tree against the latest checkpoint
 ```
 
 Ways to name a checkpoint:
@@ -151,21 +151,21 @@ Ways to name a checkpoint:
 - A full id like `ck_01m5054ddt4h527131xs986n09`, or a unique prefix such as `01m5054d`.
 - A trace id like `tr_…`, which means that trace's latest checkpoint.
 
-Sync runs in the background after each checkpoint. Run `git hf sync` to push and pull now, and to see what is still pending.
+Sync runs in the background after each checkpoint. Run `ghf sync` to push and pull now, and to see what is still pending.
 
 ## 7. Recipes
 
 ### Roll back to the last state where tests passed
 
 ```bash
-git hf trace log --annotation tests=pass   # pick the last one
-git hf checkpoint                          # capture anything pending first
-git hf trace restore <id> --in-place
+ghf trace log --annotation tests=pass   # pick the last one
+ghf checkpoint                          # capture anything pending first
+ghf trace restore <id> --in-place
 ```
 
 If anything in the working tree is not captured, the in-place restore refuses with `E_WORKTREE_DIRTY` and changes nothing. You have two ways forward:
 
-- Run `git hf checkpoint` and retry.
+- Run `ghf checkpoint` and retry.
 - Use `--force`, which takes that checkpoint for you before restoring.
 
 Either way, the state you left is one restore away.
@@ -173,7 +173,7 @@ Either way, the state you left is one restore away.
 ### Look at an old state without touching your work
 
 ```bash
-git hf trace restore @~5
+ghf trace restore @~5
 ```
 
 This creates a new Git worktree next to the repository, named `../<repo>-ghf-<suffix>`, and prints its path. Your current worktree is untouched. Add `--worktree <path>` to choose the location.
@@ -183,15 +183,15 @@ This creates a new Git worktree next to the repository, named `../<repo>-ghf-<su
 On the first machine, make sure everything is uploaded:
 
 ```bash
-git hf sync
+ghf sync
 ```
 
 On the second machine:
 
 ```bash
-git hf sync
-git hf trace list
-git hf trace restore <checkpoint-or-trace-id>
+ghf sync
+ghf trace list
+ghf trace restore <checkpoint-or-trace-id>
 ```
 
 The restored worktree gets its own new context and trace, linked to the checkpoint it came from. Uncommitted changes come across too, because checkpoints hold the working tree, not commits.
@@ -199,8 +199,8 @@ The restored worktree gets its own new context and trace, linked to the checkpoi
 ### Try two approaches from the same point
 
 ```bash
-git hf trace fork <id> --worktree ../attempt-a
-git hf trace fork <id> --worktree ../attempt-b
+ghf trace fork <id> --worktree ../attempt-a
+ghf trace fork <id> --worktree ../attempt-b
 ```
 
 Run one agent in each worktree. When one wins, finalize the losing trace as abandoned (see [8. Finishing work](#8-finishing-work)).
@@ -208,20 +208,45 @@ Run one agent in each worktree. When one wins, finalize the losing trace as aban
 ### Bring changes from one trace into another
 
 ```bash
-git hf trace apply <from>..<to>   # the changes between two checkpoints
-git hf trace apply <id>           # one checkpoint's own changes
+ghf trace apply <from>..<to>   # the changes between two checkpoints
+ghf trace apply <id>           # one checkpoint's own changes
 ```
 
 Apply runs a three-way merge onto your working tree.
 
 - **On conflict,** it stops and changes nothing, listing the conflicts with a reason for each.
-- **To resolve by hand,** add `--write-conflicts` to leave standard conflict markers. Fix them, then run `git hf checkpoint`.
+- **To resolve by hand,** add `--write-conflicts` to leave standard conflict markers. Fix them, then run `ghf checkpoint`.
+
+### Capture changes no hook sees
+
+```bash
+ghf watch
+```
+
+Run it beside the agent, for example in another terminal or as a background service. After each burst of file changes settles (2 seconds by default, `--debounce` to change), it takes a checkpoint. That catches generators, background processes and edits in your editor.
+
+The watcher works on behalf of whoever is writing the trace. Its checkpoints carry the agent's name, are marked `captured_by=watch`, and never take the trace away from the agent.
+
+### Keep what you staged
+
+Every checkpoint records the Git index too: what was staged, including partial staging. Restores leave your index alone unless you ask:
+
+```bash
+ghf trace restore <id> --index              # new worktree with the same staged changes
+ghf trace restore <id> --in-place --index   # roll back files and the index
+```
+
+`--index` writes the staged content into Git's object store and index, exactly as `git add` would. That is the only time ghf writes to Git.
+
+### Submodules
+
+A checkpoint records which commit each submodule has checked out. On restore, a submodule that is checked out, clean and has that commit locally is moved to it. Otherwise ghf leaves it alone and tells you what to run, for example `git submodule update --init lib`.
 
 ### Show a reviewer what was tried
 
 ```bash
-git hf trace log <trace>
-git hf trace diff <a> <b>
+ghf trace log <trace>
+ghf trace diff <a> <b>
 ```
 
 ### Viewing traces in a browser
@@ -239,13 +264,13 @@ They open `https://ghf.example.com/ui`, paste the token once, and can browse eve
 Commit and push the way you always do. Then tell ghf the work is done:
 
 ```bash
-git hf trace close                                      # stop writing to this trace
-git hf trace finalize --commit "$(git rev-parse HEAD)"  # after the commit is on main
+ghf trace close                                      # stop writing to this trace
+ghf trace finalize --commit "$(git rev-parse HEAD)"  # after the commit is on main
 ```
 
 `finalize --commit` checks that the commit is reachable from the main branch. That is `origin/HEAD`, `origin/main` and so on, or `[git] main` in `.ghf`.
 
-If you drop the work instead, run `git hf trace finalize --abandoned`.
+If you drop the work instead, run `ghf trace finalize --abandoned`.
 
 **Pruning.**
 - A finalized trace is deleted from the server and the local store 30 days after finalization.
@@ -255,11 +280,11 @@ If you drop the work instead, run `git hf trace finalize --abandoned`.
 **Keeping a trace longer:**
 
 ```bash
-git hf trace pin <trace>                          # until you unpin it
-git hf trace hold <trace> --name audit --expires 14d
+ghf trace pin <trace>                          # until you unpin it
+ghf trace hold <trace> --name audit --expires 14d
 ```
 
-Pruning runs on the server every hour, or on demand with `git hf prune`. It never touches Git.
+Pruning runs on the server every hour, or on demand with `ghf prune`. It never touches Git.
 
 ## 9. Using ghf from pipelines and agents
 
@@ -275,41 +300,40 @@ Branch on `error.code`, never on message text. Exit codes group the errors: 3 me
 
 | Setting | Effect |
 |---|---|
-| `git hf init --strict`, or `GHF_STRICT=1` | A failed capture stops the agent instead of warning. Use this in CI-like pipelines. |
+| `ghf init --strict`, or `GHF_STRICT=1` | A failed capture stops the agent instead of warning. Use this in CI-like pipelines. |
 | `GHF_WRITER=<id>` | Names the writer. Hooks already use the agent's session id. |
 | `GHF_TRACE_NAME=<ticket>` | Names the trace a run opens, for example after the ticket. |
-| `GHF_SYNC=manual` | Sync only when you run `git hf sync`. |
+| `GHF_SYNC=manual` | Sync only when you run `ghf sync`. |
 | `--idempotency-key <key>` | A retried command does not act twice. |
 
 **Parallel agents.** Give each one its own Git worktree with `git worktree add ../task-b`. Two agents in one worktree conflict: the second gets `E_WRITER_LOCKED`.
 
 ## 10. What ghf does not capture
 
-- **Out-of-band writes.** Hooks fire on the agent's own tool calls. Files written by a background process, a code generator or a person in an editor are picked up at the next checkpoint, not at the moment they change.
-- **Staged changes.** The Git index is not saved. A restore brings back file contents, not what was staged.
+- **Out-of-band writes, unless you watch.** Hooks fire on the agent's own tool calls. Files written by a background process, a code generator or a person in an editor are picked up at the next checkpoint. Run `ghf watch` to checkpoint them as they happen (see [7. Recipes](#capture-changes-no-hook-sees)).
 - **Ignored, oversized and special files.**
   - Anything matched by `.gitignore`, `.git/info/exclude`, your global excludes or `.ghfignore`.
   - Files over 100 MB. The limit is `capture.max_file_size`, and skipped files are listed in the checkpoint.
-  - Submodules.
+- **Inside submodules.** A submodule is recorded as the commit it has checked out; uncommitted changes inside it are not captured.
 - **New files in ignored-only directories.** A new file in a directory that so far held only ignored files can take up to a minute to appear in checkpoints.
 
 Restore and apply never overwrite a file ghf did not capture. If one is in the way, they refuse and list it.
 
 ## 11. Troubleshooting
 
-Start with `git hf status`. It lists recent capture failures, unsynced checkpoints and any server problem.
+Start with `ghf status`. It lists recent capture failures, unsynced checkpoints and any server problem.
 
 | You see | Cause | Do |
 |---|---|---|
-| `E_NOT_INITIALIZED` | No `.ghf` in this repository | `git hf init`, or pull the commit that adds it |
-| `E_UNTRUSTED_SERVER` | This machine hasn't approved the server | `git hf trust` |
-| `E_AUTH` | Missing or rejected token | `echo "$TOKEN" \| git hf login`, or set `GHF_TOKEN` |
-| `E_SERVER_MISMATCH` | The server's identity changed | Confirm with the server's operator, then `git hf trust` |
-| `E_SERVER` | Server unreachable | Keep working; checkpoints are safe locally. `git hf sync` later |
+| `E_NOT_INITIALIZED` | No `.ghf` in this repository | `ghf init`, or pull the commit that adds it |
+| `E_UNTRUSTED_SERVER` | This machine hasn't approved the server | `ghf trust` |
+| `E_AUTH` | Missing or rejected token | `echo "$TOKEN" \| ghf login`, or set `GHF_TOKEN` |
+| `E_SERVER_MISMATCH` | The server's identity changed | Confirm with the server's operator, then `ghf trust` |
+| `E_SERVER` | Server unreachable | Keep working; checkpoints are safe locally. `ghf sync` later |
 | `E_WRITER_LOCKED` | Another agent owns this worktree's trace | Use a separate worktree. If the owner is gone, wait 30 minutes or pass `--takeover` |
-| `E_WORKTREE_DIRTY` | A restore would lose uncaptured work | `git hf checkpoint` first, restore into a new worktree, or use `--force` |
+| `E_WORKTREE_DIRTY` | A restore would lose uncaptured work | `ghf checkpoint` first, restore into a new worktree, or use `--force` |
 | `E_APPLY_CONFLICT` | Both sides changed the same lines or files | Resolve by hand or use `--write-conflicts` |
-| `E_NOT_FOUND` | Unknown checkpoint id | `git hf sync` to pull other machines' traces |
+| `E_NOT_FOUND` | Unknown checkpoint id | `ghf sync` to pull other machines' traces |
 | `E_OBJECT_MISSING` | The checkpoint was pruned, or never left its machine | Pick another checkpoint, or sync the machine that made it |
 | `E_COMMIT_NOT_REACHABLE` | The commit isn't on the main branch yet | Merge first, `git fetch`, then finalize |
 | "refused by the server" in `status` | The trace was pruned on the server | Those checkpoints remain restorable on this machine only |
@@ -318,13 +342,13 @@ To see where capture time goes, run a checkpoint with `GHF_TIMING=1`.
 
 If the hooks seem silent, check two things:
 
-- `git hf hooks status claude-code` shows whether the hooks are installed.
-- `git-hf` must be on the agent's `PATH`.
+- `ghf hooks status claude-code` shows whether the hooks are installed.
+- `git-hf` must be on the agent's `PATH`: the hooks call `git hf hook …`.
 
 ## 12. Removing ghf
 
 ```bash
-git hf hooks uninstall claude-code
+ghf hooks uninstall claude-code
 git rm .ghf
 rm -rf "$(git rev-parse --git-common-dir)/ghf"   # local checkpoints for this repository
 ```

@@ -1269,6 +1269,7 @@ fn mode_word(m: Mode) -> &'static str {
         Mode::Exec => "executable",
         Mode::Symlink => "symlink",
         Mode::Tree => "directory",
+        Mode::Gitlink => "submodule",
     }
 }
 

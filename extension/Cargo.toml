@@ -1,15 +1,24 @@
 [package]
 name = "git-hf"
-description = "ghf client: high-frequency checkpoints for AI agents, run as `git hf`"
+description = "ghf client: high-frequency checkpoints for AI agents, run as `ghf` or `git hf`"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[lib]
+name = "git_hf"
+path = "src/lib.rs"
+
 [[bin]]
 name = "git-hf"
-path = "src/main.rs"
+path = "src/bin/git-hf.rs"
+
+# The same program under its standalone name.
+[[bin]]
+name = "ghf"
+path = "src/bin/ghf.rs"
 
 [dependencies]
 ghf-proto.workspace = true
@@ -23,6 +32,7 @@ ureq.workspace = true
 ignore.workspace = true
 similar.workspace = true
 humantime.workspace = true
+notify.workspace = true
 
 [lints]
 workspace = true

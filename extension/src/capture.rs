@@ -4,7 +4,8 @@
 
 use std::collections::BTreeMap;
 
-use ghf_proto::{Change, ChangeStatus, CheckpointRecord, TraceRecord, TraceState};
+use ghf_proto::object::{Kind, Mode};
+use ghf_proto::{Change, ChangeStatus, CheckpointRecord, IndexState, TraceRecord, TraceState};
 use serde_json::json;
 
 use crate::error::{Failure, Result};
@@ -23,6 +24,12 @@ pub struct Request {
     pub trace_name: Option<String>,
     /// Record a checkpoint even when nothing changed.
     pub force: bool,
+    /// Capture on behalf of the trace's current writer instead of competing
+    /// for it (the file watcher). Never claims or refreshes the lease.
+    pub companion: bool,
+    /// Skip the checkpoint when nothing changed, even with a message or
+    /// annotations.
+    pub only_if_changed: bool,
 }
 
 #[derive(Debug)]
@@ -68,6 +75,15 @@ pub fn check_writer(ws: &Workspace, trace: &TraceRow, writer: &str, takeover: bo
     Ok(())
 }
 
+/// The writer holding a fresh lease on `trace`, if any.
+pub fn lease_holder(ws: &Workspace, trace: &TraceRow) -> Result<Option<String>> {
+    let ttl = ws.cfg.writer_ttl_ms()?;
+    Ok(trace
+        .writer
+        .clone()
+        .filter(|_| ghf_proto::id::now_ms() < trace.lease_at.unwrap_or(0).saturating_add(ttl)))
+}
+
 pub fn checkpoint(ws: &Workspace, req: &Request) -> Result<Outcome> {
     let t = crate::timing::Timer::new();
     let _lock = lock(ws)?;
@@ -86,6 +102,20 @@ pub fn lock(ws: &Workspace) -> Result<FileLock> {
 /// [`checkpoint`] for callers already holding [`lock`].
 pub fn checkpoint_locked(ws: &Workspace, req: &Request) -> Result<Outcome> {
     let open = ws.store.open_trace(&ws.ctx.id)?;
+    let adopted;
+    let req = match (&open, req.companion) {
+        (Some(t), true) => match lease_holder(ws, t)? {
+            Some(owner) => {
+                adopted = Request {
+                    writer: owner,
+                    ..req.clone()
+                };
+                &adopted
+            }
+            None => req,
+        },
+        _ => req,
+    };
     if let Some(t) = &open {
         check_writer(ws, t, &req.writer, req.takeover)?;
     }
@@ -121,14 +151,20 @@ fn record_in_tx(
         Some(t) => ws.store.latest_checkpoint(&t.record.id)?,
         None => None,
     };
-    let unchanged = latest.as_ref().is_some_and(|l| l.root == snap.root);
+    let index = index_state(ws)?;
+    let unchanged = latest
+        .as_ref()
+        .is_some_and(|l| l.root == snap.root && l.index == index);
+    let skip_unchanged =
+        req.only_if_changed || (req.message.is_none() && req.annotations.is_empty());
     if let (Some(t), Some(l)) = (&open, &latest)
         && unchanged
         && !req.force
-        && req.message.is_none()
-        && req.annotations.is_empty()
+        && skip_unchanged
     {
-        ws.store.set_writer(&t.record.id, Some(&req.writer), now)?;
+        if !req.companion {
+            ws.store.set_writer(&t.record.id, Some(&req.writer), now)?;
+        }
         return Ok(Outcome {
             checkpoint: l.clone(),
             trace: t.record.clone(),
@@ -183,15 +219,138 @@ fn record_in_tx(
         annotations: req.annotations.clone(),
         changes,
         skipped: snap.skipped,
+        index,
     };
     ws.store.insert_checkpoint(&ck, false)?;
-    ws.store.set_writer(&trace.id, Some(&req.writer), now)?;
+    // A companion capture never claims the trace, so the next real writer
+    // (an agent's hook) is not locked out.
+    if !req.companion {
+        ws.store.set_writer(&trace.id, Some(&req.writer), now)?;
+    }
     Ok(Outcome {
         checkpoint: ck,
         trace,
         created: true,
         trace_created,
     })
+}
+
+/// Cached staged state, keyed by the index file's stamp and HEAD.
+#[derive(serde::Serialize, serde::Deserialize, PartialEq)]
+struct IndexCache {
+    stamp: (i64, u64, u64),
+    head: Option<String>,
+    state: Option<IndexState>,
+}
+
+fn index_stamp(ws: &Workspace) -> Option<(i64, u64, u64)> {
+    let md = std::fs::metadata(ws.repo.git_dir.join("index")).ok()?;
+    let mtime = md
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos() as i64;
+    Some((mtime, md.len(), file_id(&md)))
+}
+
+#[cfg(unix)]
+fn file_id(md: &std::fs::Metadata) -> u64 {
+    std::os::unix::fs::MetadataExt::ino(md)
+}
+
+#[cfg(not(unix))]
+fn file_id(_md: &std::fs::Metadata) -> u64 {
+    0
+}
+
+/// What is staged in the Git index relative to HEAD, as ghf content. Only
+/// recomputed when the index file or HEAD changed; paths excluded by
+/// `.ghfignore` or over the size limit are left out.
+pub fn index_state(ws: &Workspace) -> Result<Option<IndexState>> {
+    let head = ws.repo.head();
+    let key = format!("index:{}", ws.ctx.id);
+    let stamp = index_stamp(ws);
+    let now_ns = ghf_proto::id::now_ms().saturating_mul(1_000_000);
+    if let Some(stamp) = stamp
+        && let Some(cached) = ws
+            .store
+            .kv_get(&key)?
+            .and_then(|s| serde_json::from_str::<IndexCache>(&s).ok())
+        && cached.stamp == stamp
+        && cached.head == head
+        // A recently written index could change again within its mtime tick.
+        && stamp.0 < now_ns - 2_000_000_000
+        && cached.state.as_ref().is_none_or(|s| ws.store.has_object(&s.staged))
+    {
+        return Ok(cached.state);
+    }
+    let ignore = scan::ghfignore(&ws.repo.root);
+    let max = ws.cfg.max_file_size()?;
+    let entries: Vec<_> = ws
+        .repo
+        .staged()?
+        .into_iter()
+        .filter(|e| {
+            e.path.split('/').all(ghf_proto::object::safe_name)
+                && !ignore
+                    .matched_path_or_any_parents(&e.path, false)
+                    .is_ignore()
+        })
+        .collect();
+    let state = if entries.is_empty() {
+        None
+    } else {
+        let blobs: Vec<&crate::git::StagedEntry> = entries
+            .iter()
+            .filter(|e| !e.deleted && e.mode != "160000")
+            .collect();
+        let contents = ws
+            .repo
+            .cat_blobs(&blobs.iter().map(|e| e.oid.clone()).collect::<Vec<_>>())?;
+        let mut content_of: std::collections::HashMap<&str, Vec<u8>> = blobs
+            .iter()
+            .map(|e| e.path.as_str())
+            .zip(contents)
+            .collect();
+        let mut manifest = scan::Manifest::new();
+        let mut removed = Vec::new();
+        for e in &entries {
+            if e.deleted {
+                removed.push(e.path.clone());
+                continue;
+            }
+            let mode = Mode::from_git_mode(&e.mode);
+            let content = if mode == Mode::Gitlink {
+                e.oid.clone().into_bytes()
+            } else {
+                content_of.remove(e.path.as_str()).unwrap_or_default()
+            };
+            if content.len() as u64 > max {
+                continue;
+            }
+            let id = ws.store.put(Kind::Blob, &content)?;
+            manifest.insert(
+                e.path.clone(),
+                scan::FileEntry {
+                    mode,
+                    id,
+                    size: content.len() as u64,
+                },
+            );
+        }
+        let staged = scan::build_tree(&manifest, Some(&ws.store))?;
+        Some(IndexState { staged, removed })
+    };
+    if let Some(stamp) = stamp {
+        let cache = IndexCache {
+            stamp,
+            head,
+            state: state.clone(),
+        };
+        ws.store.kv_set(&key, &serde_json::to_string(&cache)?)?;
+    }
+    Ok(state)
 }
 
 /// Changes of a parentless checkpoint, relative to Git HEAD.

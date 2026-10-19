@@ -353,11 +353,13 @@ async fn put_checkpoint(
                 format!("trace {} is pruned", t.id),
             ));
         }
-        if let Some(m) = store.missing_in_closure(&repo, &c.root)? {
-            return Err(bad(
-                ErrorCode::ObjectMissing,
-                format!("object {} of checkpoint {} is missing", m.short(), c.id),
-            ));
+        for root in c.roots() {
+            if let Some(m) = store.missing_in_closure(&repo, &root)? {
+                return Err(bad(
+                    ErrorCode::ObjectMissing,
+                    format!("object {} of checkpoint {} is missing", m.short(), c.id),
+                ));
+            }
         }
         store.insert_checkpoint(&repo, &c)
     })

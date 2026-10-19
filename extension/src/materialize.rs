@@ -23,6 +23,46 @@ use crate::{err, fail};
 pub struct Stats {
     pub written: usize,
     pub deleted: usize,
+    /// Submodules that could not be moved to the recorded commit.
+    pub warnings: Vec<String>,
+}
+
+/// Move a submodule to `sha`, but only when that is safe: it is checked
+/// out, has no uncommitted changes, and has the commit locally. Returns a
+/// warning instead of acting otherwise; never fetches.
+fn checkout_submodule(root: &Path, path: &str, sha: &str) -> Option<String> {
+    let dir = root.join(path);
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .current_dir(&dir)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()
+    };
+    if crate::scan::submodule_head(&dir).is_none() {
+        return Some(format!(
+            "submodule {path} is not checked out; run `git submodule update --init {path}`, then `git -C {path} checkout {sha}`"
+        ));
+    }
+    let dirty = git(&["status", "--porcelain", "--untracked-files=no"])
+        .is_none_or(|o| !o.status.success() || !o.stdout.is_empty());
+    if dirty {
+        return Some(format!(
+            "submodule {path} has uncommitted changes; left as is (checkpoint had {sha})"
+        ));
+    }
+    let have =
+        git(&["cat-file", "-e", &format!("{sha}^{{commit}}")]).is_some_and(|o| o.status.success());
+    if !have {
+        return Some(format!(
+            "submodule {path} does not have commit {sha}; fetch it, then `git -C {path} checkout {sha}`"
+        ));
+    }
+    match git(&["checkout", "-q", "--detach", sha]) {
+        Some(o) if o.status.success() => None,
+        _ => Some(format!("submodule {path}: checkout of {sha} failed")),
+    }
 }
 
 /// Make the captured state of the worktree at `root` equal `target`.
@@ -57,7 +97,13 @@ pub fn materialize(
 
     let mut stats = Stats::default();
     let mut touched_dirs = BTreeSet::new();
-    for path in current.keys().filter(|p| !target.contains_key(*p)) {
+    for (path, e) in current.iter().filter(|(p, _)| !target.contains_key(*p)) {
+        if e.mode == Mode::Gitlink {
+            stats.warnings.push(format!(
+                "submodule {path} is not in the checkpoint; left in place"
+            ));
+            continue;
+        }
         let full = root.join(path);
         match fs::remove_file(&full) {
             Ok(()) => stats.deleted += 1,
@@ -71,6 +117,15 @@ pub fn materialize(
 
     for (path, e) in target {
         if current.get(path) == Some(e) {
+            continue;
+        }
+        if e.mode == Mode::Gitlink {
+            let sha = String::from_utf8_lossy(&store.blob(&e.id)?).into_owned();
+            if let Some(w) = checkout_submodule(root, path, &sha) {
+                stats.warnings.push(w);
+            } else {
+                stats.written += 1;
+            }
             continue;
         }
         let full = root.join(path);
@@ -101,7 +156,7 @@ pub fn materialize(
                 }
                 fs::rename(&tmp, &full).context(|| format!("write {path}"))?;
             }
-            Mode::Tree => unreachable!("manifests hold files only"),
+            Mode::Tree | Mode::Gitlink => unreachable!("handled above"),
         }
         stats.written += 1;
     }
@@ -149,7 +204,7 @@ pub fn blockers(root: &Path, target: &Manifest, current: &Manifest) -> Vec<Strin
                 out.insert(prefix.clone());
             }
         }
-        if unchanged || current.contains_key(path) {
+        if unchanged || current.contains_key(path) || e.mode == Mode::Gitlink {
             continue;
         }
         match fs::symlink_metadata(root.join(path)) {

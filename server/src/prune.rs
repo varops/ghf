@@ -98,7 +98,9 @@ pub fn prune_repo(
         if dry_run && doomed_ids.contains(c.trace_id.as_str()) && !keep.contains(&c.id) {
             continue;
         }
-        store.mark(repo, &c.root, &mut live)?;
+        for root in c.roots() {
+            store.mark(repo, &root, &mut live)?;
+        }
     }
     let (n, bytes) = store.sweep(repo, &live, grace(), dry_run)?;
     report.objects_deleted = n;

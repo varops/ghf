@@ -138,6 +138,7 @@ fn checkpoint(
             })
             .collect(),
         skipped: vec![],
+        index: None,
     }
 }
 

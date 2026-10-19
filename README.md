@@ -7,7 +7,7 @@
 
 ghf (Git High Frequency) saves the state of a worktree every time an agent finishes an edit. Each save is a **checkpoint**. The checkpoints for one unit of work form a **trace**. Any agent on any authorized machine can list, diff, restore, apply or fork a trace.
 
-ghf sits next to Git, not inside it. It writes nothing into commits, messages, refs, notes or the object database. Accepted work still lands as ordinary Git commits and pull requests, and plain Git users never need to know ghf exists.
+ghf sits next to Git, not inside it. It writes nothing into commits, messages, refs or notes, and touches Git's index and object store only when you ask it to re-stage a checkpoint's staged changes (`--index`), exactly as `git add` would. Accepted work still lands as ordinary Git commits and pull requests, and plain Git users never need to know ghf exists.
 
 - **Git** holds accepted history.
 - **ghf** holds recoverable working history, with its own retention, permissions and sync.
@@ -18,10 +18,10 @@ ghf sits next to Git, not inside it. It writes nothing into commits, messages, r
 
 | Use case | How |
 |---|---|
-| Roll back to the last green state | `git hf trace log --annotation tests=pass`, then `git hf trace restore <id> --in-place` |
-| Hand work to another machine | `git hf sync` here; `git hf trace restore <id>` there |
-| Try two approaches from one point | `git hf trace fork <id>` once per attempt |
-| Show a human what was tried | `git hf trace log` and `git hf trace diff <a> <b>` |
+| Roll back to the last green state | `ghf trace log --annotation tests=pass`, then `ghf trace restore <id> --in-place` |
+| Hand work to another machine | `ghf sync` here; `ghf trace restore <id>` there |
+| Try two approaches from one point | `ghf trace fork <id>` once per attempt |
+| Show a human what was tried | `ghf trace log` and `ghf trace diff <a> <b>` |
 | Survive a crashed worker | A checkpoint is acknowledged only after it is durable locally; sync catches up later |
 
 New here? Start with the [user guide](docs/guide.md).
@@ -38,7 +38,7 @@ Requirements:
 cargo install --git https://github.com/varops/ghf git-hf ghf-server
 ```
 
-You can also download a binary from [Releases](https://github.com/varops/ghf/releases). Put `git-hf` on your `PATH`, and Git runs it as `git hf`.
+You can also download the binaries from [Releases](https://github.com/varops/ghf/releases). The client installs under two names that run the same program: `ghf`, and `git-hf`, which Git runs as `git hf`. Use whichever you prefer.
 
 ## Quick start
 
@@ -52,51 +52,52 @@ ghf-server --data-dir /var/lib/ghf serve --listen 0.0.0.0:7878 --tls-cert cert.p
 **2. Enable a repository.** `.ghf` holds no secrets, so you can commit it.
 
 ```bash
-git hf init --server https://ghf.example.com --repository acme/project
+ghf init --server https://ghf.example.com --repository acme/project
 git add .ghf && git commit -m "Enable ghf"
 ```
 
 **3. Set up each machine.** This is done once per machine.
 
 ```bash
-git hf trust                       # approve the server for uploads
-echo "$GHF_TOKEN" | git hf login   # or export GHF_TOKEN
-git hf hooks install claude-code   # automatic capture (also: cursor)
-git hf skill install               # teach the agent the workflow
+ghf trust                       # approve the server for uploads
+echo "$GHF_TOKEN" | ghf login   # or export GHF_TOKEN
+ghf hooks install claude-code   # automatic capture (also: cursor)
+ghf skill install               # teach the agent the workflow
 ```
 
 **4. Work.** Hooks take a checkpoint after every agent edit. You can also take one yourself:
 
 ```bash
-git hf checkpoint -m "parser passes" --annotate tests=pass
-git hf status
-git hf trace log
-git hf trace diff @~2 @
-git hf trace restore @~2                      # into a new worktree
-git hf trace restore @~2 --in-place           # refused if anything is uncaptured
-git hf trace apply ck_01j9..ck_01ja           # three-way merge onto this worktree
-git hf trace fork @                           # new worktree, new trace
-git hf trace close
-git hf trace finalize --commit "$(git rev-parse HEAD)"
+ghf checkpoint -m "parser passes" --annotate tests=pass
+ghf status
+ghf trace log
+ghf trace diff @~2 @
+ghf trace restore @~2                      # into a new worktree
+ghf trace restore @~2 --in-place           # refused if anything is uncaptured
+ghf trace apply ck_01j9..ck_01ja           # three-way merge onto this worktree
+ghf trace fork @                           # new worktree, new trace
+ghf trace close
+ghf trace finalize --commit "$(git rev-parse HEAD)"
 ```
 
 ## What capture covers
 
-Capture runs after each file-editing or shell tool call in a supported harness (Claude Code, Cursor), or whenever `git hf checkpoint` runs.
+Capture runs after each file-editing or shell tool call in a supported harness (Claude Code, Cursor), or whenever `ghf checkpoint` runs.
 
 **Captured:**
 - Tracked files and untracked files that are not ignored.
 - Deletes and renames.
 - The executable bit.
 - Symlinks, stored as links.
+- Staged changes (the Git index). Restore re-stages them only with `--index`.
+- Submodules, as the commit each one has checked out.
 
 **Not captured:**
 - Paths matched by `.gitignore` or `.ghfignore`. Use `.ghfignore` for anything that must never leave the machine.
 - Files over `capture.max_file_size` (default 100 MB). These are recorded as skipped.
-- Submodules.
-- The Git index (staged state).
+- Uncommitted changes inside a submodule.
 
-**Not seen:** hooks fire on the agent's tool calls. Anything else that writes files is invisible until the next checkpoint: a background process, a generator run outside a tool call, or a human in an editor. Because every checkpoint is a full worktree state, the next checkpoint picks those changes up.
+**Not seen by hooks:** hooks fire on the agent's tool calls. A background process, a generator run outside a tool call, or a human in an editor writes files no hook sees. Run `ghf watch` beside the agent to checkpoint those changes as they happen. Without it, the next checkpoint still picks them up, because every checkpoint is a full worktree state.
 
 ## Safety rules
 
@@ -148,10 +149,10 @@ To see where time goes in one capture, set `GHF_TIMING=1`.
 
 | Path | Crate | What it is |
 |---|---|---|
-| [`extension/`](extension) | `git-hf` | Client binary that Git runs as `git hf` |
+| [`extension/`](extension) | `git-hf` | Client: the `ghf` and `git-hf` binaries (Git runs the latter as `git hf`) |
 | [`server/`](server) | `ghf-server` | Canonical store for checkpoints and traces |
 | [`proto/`](proto) | `ghf-proto` | Shared object format, records, API types and error codes |
-| [`skills/ghf/`](skills/ghf) | | Agent skill; `git hf skill install` writes it |
+| [`skills/ghf/`](skills/ghf) | | Agent skill; `ghf skill install` writes it |
 | [`docs/`](docs) | | [User guide](docs/guide.md), [CLI reference](docs/cli.md), [server guide](docs/server.md) |
 
 ## Development

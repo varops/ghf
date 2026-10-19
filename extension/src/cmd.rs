@@ -387,6 +387,7 @@ pub fn checkpoint(env: &Env, a: CheckpointArgs) -> Result<Out> {
             .trace_name
             .or_else(|| std::env::var("GHF_TRACE_NAME").ok()),
         force: a.force,
+        ..Default::default()
     };
     let repo = Repo::discover(&env.cwd)?;
     let ws = match Workspace::open(&env.cwd) {
@@ -711,9 +712,35 @@ fn default_worktree_path(ws: &Workspace, ck: &CheckpointRecord) -> PathBuf {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "repo".into());
     let tail = &ck.id[ck.id.len() - 8..];
-    root.parent()
-        .unwrap_or(Path::new("/"))
-        .join(format!("{name}-ghf-{tail}"))
+    let parent = root.parent().unwrap_or(Path::new("/"));
+    // Restoring the same checkpoint again gets the next free name.
+    (1..)
+        .map(|n| match n {
+            1 => parent.join(format!("{name}-ghf-{tail}")),
+            n => parent.join(format!("{name}-ghf-{tail}-{n}")),
+        })
+        .find(|p| !p.exists())
+        .expect("a free name exists")
+}
+
+/// Restage a checkpoint's captured index: reset the index to its base
+/// revision, then stage the recorded content, as `git add` would. Returns
+/// the number of staged paths.
+fn restage(repo: &Repo, store: &crate::store::Store, ck: &CheckpointRecord) -> Result<usize> {
+    let Some(ix) = &ck.index else { return Ok(0) };
+    let rev = ck
+        .base_rev
+        .as_deref()
+        .and_then(|r| repo.resolve_commit(r))
+        .or_else(|| repo.head())
+        .ok_or_else(|| err!(Usage, "no base revision to restage against"))?;
+    repo.read_tree(&rev)?;
+    let mut entries = Vec::new();
+    for (path, e) in scan::flatten(store, &ix.staged)? {
+        entries.push((path, e.mode.git_mode().to_owned(), store.blob(&e.id)?));
+    }
+    repo.stage(&entries, &ix.removed, &store.tmp_dir())?;
+    Ok(entries.len() + ix.removed.len())
 }
 
 /// Restore `ck` into a new Git worktree with a new context and a new trace
@@ -723,6 +750,7 @@ fn restore_new_worktree(
     ws: &Workspace,
     ck: &CheckpointRecord,
     path: Option<PathBuf>,
+    index: bool,
 ) -> Result<Out> {
     let path = match path {
         Some(p) if p.is_absolute() => p,
@@ -736,7 +764,9 @@ fn restore_new_worktree(
     {
         fail!(PathExists, "{} already exists", path.display());
     }
-    remote::ensure_objects(ws, &ck.root, env.prompt())?;
+    for root in if index { ck.roots() } else { vec![ck.root] } {
+        remote::ensure_objects(ws, &root, env.prompt())?;
+    }
     let mut warnings = Vec::new();
     let rev = match ck
         .base_rev
@@ -771,6 +801,15 @@ fn restore_new_worktree(
     )?;
     let stats =
         materialize::materialize(&new_ws.repo.root, &new_ws.store, &target, &current.files)?;
+    warnings.extend(stats.warnings.iter().cloned());
+    let restaged = if index {
+        restage(&new_ws.repo, &new_ws.store, ck)?
+    } else {
+        if ck.index.is_some() {
+            warnings.push("the checkpoint has staged changes; pass --index to restage them".into());
+        }
+        0
+    };
     let _lock = capture::lock(&new_ws)?;
     // Content, verification and the new trace commit together.
     let o = new_ws.store.tx(|| {
@@ -779,7 +818,8 @@ fn restore_new_worktree(
             &new_ws.store,
             &capture::scan_options(&new_ws, true)?,
         )?;
-        if snap.root != ck.root {
+        // Submodules may legitimately sit at another commit (warned above).
+        if scan::without_gitlinks(&snap.files) != scan::without_gitlinks(&target) {
             fail!(
                 Internal,
                 "restored worktree does not match checkpoint {} (got {})",
@@ -819,6 +859,7 @@ fn restore_new_worktree(
             "checkpoint": o.checkpoint,
             "restored_from": ck.id,
             "files_written": stats.written,
+            "restaged": restaged,
             "warnings": warnings,
         }),
         human,
@@ -831,13 +872,16 @@ pub fn trace_restore(
     worktree: Option<PathBuf>,
     in_place: bool,
     force: bool,
+    index: bool,
 ) -> Result<Out> {
     let ws = env.ws()?;
     let ck = resolve_checkpoint(&ws, &r, env.prompt())?;
     if !in_place {
-        return restore_new_worktree(env, &ws, &ck, worktree);
+        return restore_new_worktree(env, &ws, &ck, worktree, index);
     }
-    remote::ensure_objects(&ws, &ck.root, env.prompt())?;
+    for root in if index { ck.roots() } else { vec![ck.root] } {
+        remote::ensure_objects(&ws, &root, env.prompt())?;
+    }
     let writer = workspace::default_writer();
     let _lock = capture::lock(&ws)?;
     let open = ws.store.open_trace(&ws.ctx.id)?;
@@ -852,7 +896,9 @@ pub fn trace_restore(
             Some(t) => ws.store.latest_checkpoint(&t.record.id)?,
             None => None,
         };
-        if latest.as_ref().is_some_and(|l| l.root == snap.root) {
+        // With --index the index is rewritten too, so it must be captured.
+        let index_clean = !index || latest.as_ref().map(|l| &l.index) == Some(&capture::index_state(&ws)?);
+        if index_clean && latest.as_ref().is_some_and(|l| l.root == snap.root) {
             return Ok((snap, None));
         }
         if !force {
@@ -874,6 +920,15 @@ pub fn trace_restore(
     })?;
     let target = scan::flatten(&ws.store, &ck.root)?;
     let stats = materialize::materialize(&ws.repo.root, &ws.store, &target, &current.files)?;
+    let mut warnings = stats.warnings.clone();
+    let restaged = if index {
+        restage(&ws.repo, &ws.store, &ck)?
+    } else {
+        if ck.index.is_some() {
+            warnings.push("the checkpoint has staged changes; pass --index to restage them".into());
+        }
+        0
+    };
     let req = Request {
         message: Some(format!("restored {}", ck.id)),
         annotations: BTreeMap::from([("restored_from".into(), ck.id.clone())]),
@@ -882,7 +937,8 @@ pub fn trace_restore(
         ..Default::default()
     };
     let o = capture::checkpoint_locked(&ws, &req)?;
-    if o.checkpoint.root != ck.root {
+    let got = scan::flatten(&ws.store, &o.checkpoint.root)?;
+    if scan::without_gitlinks(&got) != scan::without_gitlinks(&target) {
         let undo = pre
             .as_ref()
             .map(|p| p.id.clone())
@@ -902,6 +958,8 @@ pub fn trace_restore(
             "pre_restore_checkpoint": pre.as_ref().map(|p| &p.id),
             "files_written": stats.written,
             "files_deleted": stats.deleted,
+            "restaged": restaged,
+            "warnings": warnings,
         }),
         format!(
             "restored {} in place ({} written, {} deleted); recorded as {}",
@@ -910,10 +968,10 @@ pub fn trace_restore(
     ))
 }
 
-pub fn trace_fork(env: &Env, r: String, worktree: Option<PathBuf>) -> Result<Out> {
+pub fn trace_fork(env: &Env, r: String, worktree: Option<PathBuf>, index: bool) -> Result<Out> {
     let ws = env.ws()?;
     let ck = resolve_checkpoint(&ws, &r, env.prompt())?;
-    restore_new_worktree(env, &ws, &ck, worktree)
+    restore_new_worktree(env, &ws, &ck, worktree, index)
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -954,7 +1012,9 @@ fn plan_apply(
             };
             continue;
         }
-        let regular = |e: &Option<FileEntry>| e.is_none_or(|e| e.mode != Mode::Symlink);
+        let regular = |e: &Option<FileEntry>| {
+            e.is_none_or(|e| e.mode != Mode::Symlink && e.mode != Mode::Gitlink)
+        };
         let (Some(o), Some(n)) = (ours, d.new) else {
             conflicts.push(soft(
                 &d.path,
@@ -967,7 +1027,7 @@ fn plan_apply(
             continue;
         };
         if !regular(&Some(o)) || !regular(&Some(n)) || !regular(&d.old) {
-            conflicts.push(soft(&d.path, "symlink changed on both sides"));
+            conflicts.push(soft(&d.path, "symlink or submodule changed on both sides"));
             continue;
         }
         let base = match d.old {
@@ -1105,7 +1165,8 @@ pub fn trace_apply(env: &Env, range: String, write_conflicts: bool) -> Result<Ou
         ..Default::default()
     };
     let o = capture::checkpoint_locked(&ws, &req)?;
-    if o.checkpoint.root != scan::build_tree(&target, None)? {
+    let got = scan::flatten(&ws.store, &o.checkpoint.root)?;
+    if scan::without_gitlinks(&got) != scan::without_gitlinks(&target) {
         let undo = pre
             .clone()
             .or_else(|| o.checkpoint.parent.clone())
@@ -1399,8 +1460,12 @@ fn gc(ws: &Workspace) -> Result<(u64, u64)> {
     // object between the mark and its deletion.
     ws.store.tx(|| {
         let mut live = std::collections::HashSet::new();
-        let mut stack: Vec<ghf_proto::ObjectId> =
-            ws.store.all_checkpoints()?.iter().map(|c| c.root).collect();
+        let mut stack: Vec<ghf_proto::ObjectId> = ws
+            .store
+            .all_checkpoints()?
+            .iter()
+            .flat_map(|c| c.roots())
+            .collect();
         while let Some(id) = stack.pop() {
             if !live.insert(id) {
                 continue;

@@ -173,6 +173,27 @@ pub fn scan(repo: &Repo, store: &Store, opts: &ScanOptions) -> Result<Snapshot> 
     })
 }
 
+/// The commit a submodule directory has checked out, if it is a repository.
+pub fn submodule_head(dir: &Path) -> Option<String> {
+    if !dir.join(".git").exists() {
+        return None;
+    }
+    let repo = Repo::discover(dir).ok()?;
+    if repo.root != fs::canonicalize(dir).ok()? {
+        return None;
+    }
+    repo.head()
+}
+
+/// A manifest without its submodule entries, for comparisons where a
+/// submodule's checked-out commit may legitimately differ.
+pub fn without_gitlinks(m: &Manifest) -> Manifest {
+    m.iter()
+        .filter(|(_, e)| e.mode != Mode::Gitlink)
+        .map(|(p, e)| (p.clone(), *e))
+        .collect()
+}
+
 /// Stat (and if needed hash and store) one path.
 fn scan_path(
     repo: &Repo,
@@ -206,8 +227,30 @@ fn scan_path(
             Mode::File
         }
     } else if ft.is_dir() {
-        // Submodules and nested repositories.
-        return skip("submodule", None);
+        // A submodule or nested repository: record the commit it has checked
+        // out. Its own uncommitted changes are not captured.
+        return Ok(match submodule_head(&full) {
+            Some(sha) => {
+                let id = if opts.persist {
+                    store.put(Kind::Blob, sha.as_bytes())?
+                } else {
+                    object::hash(Kind::Blob, sha.as_bytes())
+                };
+                Item::File(
+                    FileEntry {
+                        mode: Mode::Gitlink,
+                        id,
+                        size: sha.len() as u64,
+                    },
+                    None,
+                )
+            }
+            None => Item::Skip(Skipped {
+                path: path.to_owned(),
+                reason: "submodule_not_checked_out".into(),
+                size: None,
+            }),
+        });
     } else {
         return skip("special_file", None);
     };
