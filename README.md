@@ -12,7 +12,7 @@ ghf sits next to Git, not inside it. It writes nothing into commits, messages, r
 - **Git** holds accepted history.
 - **ghf** holds recoverable working history, with its own retention, permissions and sync.
 
-**Status: 0.1.0-rc.1.** The full MVP is implemented: capture, sync, restore and apply, and the trace lifecycle.
+**Status: 0.1.0-rc.2.** The full MVP is implemented: capture, sync, restore and apply, and the trace lifecycle.
 
 ## What it does for a fleet
 
@@ -130,7 +130,7 @@ Measured on a 2,000-file repository, release build, Apple Silicon laptop:
 
 | Metric | Result | Target |
 |---|---|---|
-| Checkpoint after editing 1–3 existing files (200 edits) | p50 25 ms, p95 28 ms | p95 < 50 ms |
+| Checkpoint after editing 1–3 existing files (200 edits) | p50 25–27 ms, p95 28–34 ms | p95 < 50 ms |
 | Checkpoint after creating a file | p50 42 ms, p95 45–51 ms | p95 < 50 ms (borderline) |
 | Sync of 250 checkpoints (about 2,000 objects, 0.7 MB) | 2.3 s | p95 < 5 s per sync |
 | Cross-machine restore | 0.6 s | p95 < 10 s |

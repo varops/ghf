@@ -43,8 +43,8 @@ ghf never writes into Git history. Your commits, branches, refs and history are 
 Download the archive for your platform from [Releases](https://github.com/varops/ghf/releases). Each archive holds the client as `ghf` and `git-hf` (the same program under two names) plus `ghf-server`. Put them on your `PATH`:
 
 ```bash
-tar -xzf ghf-v0.1.0-rc.1-aarch64-apple-darwin.tar.gz
-sudo cp ghf-v0.1.0-rc.1-aarch64-apple-darwin/{ghf,git-hf,ghf-server} /usr/local/bin/
+tar -xzf ghf-v0.1.0-rc.2-aarch64-apple-darwin.tar.gz
+sudo cp ghf-v0.1.0-rc.2-aarch64-apple-darwin/{ghf,git-hf,ghf-server} /usr/local/bin/
 ```
 
 Or build from source with Rust 1.89 or later:

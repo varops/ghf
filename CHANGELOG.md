@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-rc.2 — 2026-10-19
 
 ### Added
 
@@ -29,7 +29,7 @@ Bench, on a 2,000-file repository:
 
 | Checkpoint after | p50 | p95 |
 |---|---|---|
-| Editing existing files | 25 ms (was 42) | 28 ms (was 85) |
+| Editing existing files | 25–27 ms (was 42) | 28–34 ms (was 85) |
 | Creating a file | 42 ms | 45–51 ms |
 
 - **Benchmark.** It now ages its fixture like a real checkout and reports new-file checkpoints separately.
