@@ -315,6 +315,14 @@ fn tail_shows_every_worktree_and_filters() {
 }
 
 #[test]
+fn tail_refuses_an_uninitialized_repository() {
+    let root = tempdir("tailinit");
+    let (_, work) = repo(&root);
+    let m = Machine::new(&root, "a");
+    assert_eq!(m.hf(&work, &["tail"]).err_code(), "E_NOT_INITIALIZED");
+}
+
+#[test]
 fn tail_follow_streams_checkpoints_and_trace_changes() {
     use std::io::{BufRead, BufReader};
 

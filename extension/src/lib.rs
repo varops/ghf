@@ -173,9 +173,9 @@ fn tail_main(command: &Command, json: bool) -> Result<()> {
         json,
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    let repo = git::Repo::discover(&cwd)?;
-    let store = store::Store::open(&repo.common_dir)?;
-    tail::run(&store, &opts)
+    // Same refusal as every other command in a repository without `.ghf`.
+    let ws = workspace::Workspace::open(&cwd)?;
+    tail::run(&ws.store, &opts)
 }
 
 /// Run a mutating command at most once per key. A replay returns the
