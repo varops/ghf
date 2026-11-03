@@ -508,6 +508,26 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Checkpoints in the order they reached this store, with their row ids,
+    /// starting after row `after`. Used to follow the store as it grows.
+    pub fn checkpoints_after(&self, after: i64) -> Result<Vec<(i64, CheckpointRecord)>> {
+        let mut st = self
+            .db
+            .prepare("SELECT rowid, record FROM checkpoints WHERE rowid > ?1 ORDER BY rowid")?;
+        let rows = st.query_map([after], |r| {
+            let json: String = r.get(1)?;
+            let c = serde_json::from_str(&json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+            Ok((r.get(0)?, c))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn checkpoint_count(&self, trace_id: &str) -> Result<i64> {
         Ok(self.db.query_row(
             "SELECT COUNT(*) FROM checkpoints WHERE trace_id = ?1",

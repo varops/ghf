@@ -143,6 +143,7 @@ ghf trace log           # its checkpoints, newest last
 ghf trace list          # every trace, including other machines' after a sync
 ghf trace diff @~3 @    # what changed over the last three checkpoints
 ghf trace diff @        # the working tree against the latest checkpoint
+ghf tail -f             # every agent's checkpoints as they land
 ```
 
 Ways to name a checkpoint:
@@ -241,6 +242,14 @@ ghf trace restore <id> --in-place --index   # roll back files and the index
 ### Submodules
 
 A checkpoint records which commit each submodule has checked out. On restore, a submodule that is checked out, clean and has that commit locally is moved to it. Otherwise ghf leaves it alone and tells you what to run, for example `git submodule update --init lib`.
+
+### Watch your agents work
+
+```bash
+ghf tail -f
+```
+
+Every checkpoint from every worktree of the repository on this machine scrolls by as it lands, one line each, with a colour per agent and `tests=pass`/`fail` in green or red. Add `--stat` to see the files, `--author claude-code` or `--annotation tests=fail` to narrow it down, or `--json` to pipe it somewhere.
 
 ### Show a reviewer what was tried
 

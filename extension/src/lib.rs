@@ -16,6 +16,7 @@ mod refs;
 mod remote;
 mod scan;
 mod store;
+mod tail;
 mod timing;
 mod watch;
 mod workspace;
@@ -87,6 +88,19 @@ pub fn run() {
         return;
     }
 
+    // Tail streams one line per event, like the watcher.
+    if let Command::Tail { .. } = &cli.command {
+        if let Err(f) = tail_main(&cli.command, cli.json) {
+            if cli.json {
+                emit_json(&Response::err("tail", f.code, &f.message, f.data));
+            } else {
+                eprintln!("{display} tail: {} ({})", f.message, f.code);
+            }
+            process::exit(f.code.exit_code() as i32);
+        }
+        return;
+    }
+
     let name = cli.command.name();
     let env = Env {
         cwd: std::env::current_dir().unwrap_or_else(|_| ".".into()),
@@ -135,6 +149,33 @@ fn watch_main(json: bool, display: &str, debounce: &str, max_wait: &str) -> Resu
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let ws = workspace::Workspace::open(&cwd)?;
     watch::run(&ws, &opts, display)
+}
+
+fn tail_main(command: &Command, json: bool) -> Result<()> {
+    let Command::Tail {
+        follow,
+        lines,
+        trace,
+        author,
+        annotations,
+        stat,
+    } = command
+    else {
+        unreachable!("only called for tail")
+    };
+    let opts = tail::Options {
+        follow: *follow,
+        lines: *lines,
+        trace: trace.clone(),
+        author: author.clone(),
+        annotations: capture::parse_annotations(annotations)?,
+        stat: *stat,
+        json,
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    // Same refusal as every other command in a repository without `.ghf`.
+    let ws = workspace::Workspace::open(&cwd)?;
+    tail::run(&ws.store, &opts)
 }
 
 /// Run a mutating command at most once per key. A replay returns the
@@ -211,7 +252,9 @@ fn dispatch(env: &Env, command: &Command) -> Result<Out> {
         Command::Trust { url } => cmd::trust(env, url.clone()),
         Command::Login { server } => cmd::login(env, server.clone()),
         Command::Prune { dry_run } => cmd::prune(env, *dry_run),
-        Command::Hook { .. } | Command::Watch { .. } => unreachable!("handled in main"),
+        Command::Hook { .. } | Command::Watch { .. } | Command::Tail { .. } => {
+            unreachable!("handled in main")
+        }
         Command::Skill(SkillCommand::Show) => Ok(Out {
             human: hooks::SKILL.trim_end().to_owned(),
             data: json!({"skill": hooks::SKILL}),

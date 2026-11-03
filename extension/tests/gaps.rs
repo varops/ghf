@@ -1,5 +1,5 @@
-//! The standalone `ghf` command, the file watcher, staged changes and
-//! submodules.
+//! The standalone `ghf` command, the file watcher, `tail`, staged changes
+//! and submodules.
 
 mod common;
 
@@ -226,5 +226,172 @@ fn submodules_are_recorded_and_restored_when_safe() {
             .to_string()
             .contains("git submodule update --init lib"),
         "{d}"
+    );
+}
+
+/// Run `tail` once and return its NDJSON envelopes.
+fn tail(m: &Machine, dir: &Path, args: &[&str]) -> Vec<Value> {
+    let out = m
+        .cmd(dir)
+        .arg("tail")
+        .args(args)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[test]
+fn tail_shows_every_worktree_and_filters() {
+    let root = tempdir("tail");
+    let (_, work) = repo(&root);
+    let m = Machine::new(&root, "a");
+    init(&m, &work);
+    let wt2 = root.join("wt2");
+    git(
+        &work,
+        &["worktree", "add", "-q", "--detach", wt2.to_str().unwrap()],
+    );
+    fs::copy(work.join(".ghf"), wt2.join(".ghf")).unwrap();
+
+    fs::write(work.join("a.txt"), "1").unwrap();
+    m.hf_env(
+        &work,
+        &["checkpoint", "--trace-name", "feat/a"],
+        &[("GHF_WRITER", "claude-code:1")],
+    )
+    .ok();
+    fs::write(wt2.join("b.txt"), "1").unwrap();
+    m.hf_env(
+        &wt2,
+        &["checkpoint", "--annotate", "tests=fail"],
+        &[("GHF_WRITER", "cursor:2")],
+    )
+    .ok();
+    fs::write(work.join("a.txt"), "2").unwrap();
+    m.hf_env(
+        &work,
+        &["checkpoint", "--annotate", "tests=pass"],
+        &[("GHF_WRITER", "claude-code:1")],
+    )
+    .ok();
+
+    // Both worktrees, oldest first, one envelope per line.
+    let all = tail(&m, &work, &[]);
+    let authors: Vec<&str> = all
+        .iter()
+        .map(|e| e["data"]["checkpoint"]["author"].as_str().unwrap())
+        .collect();
+    assert_eq!(authors, ["claude-code:1", "cursor:2", "claude-code:1"]);
+    assert!(
+        all.iter()
+            .all(|e| e["command"] == "tail" && e["data"]["event"] == "checkpoint")
+    );
+    assert_eq!(all[0]["data"]["trace"]["name"], "feat/a");
+
+    assert_eq!(tail(&m, &work, &["-n", "1"]).len(), 1);
+    assert_eq!(tail(&m, &work, &["--author", "cursor"]).len(), 1);
+    assert_eq!(tail(&m, &work, &["--trace", "feat/a"]).len(), 2);
+    let fails = tail(&m, &work, &["--annotation", "tests=fail"]);
+    assert_eq!(fails.len(), 1);
+    assert_eq!(fails[0]["data"]["checkpoint"]["author"], "cursor:2");
+
+    // Human output names the trace and shows the result badge.
+    let out = m.cmd(&work).args(["tail", "--stat"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("feat/a") && text.contains("tests=pass"),
+        "{text}"
+    );
+    assert!(text.contains("M a.txt") && !text.contains('\x1b'), "{text}");
+}
+
+#[test]
+fn tail_refuses_an_uninitialized_repository() {
+    let root = tempdir("tailinit");
+    let (_, work) = repo(&root);
+    let m = Machine::new(&root, "a");
+    assert_eq!(m.hf(&work, &["tail"]).err_code(), "E_NOT_INITIALIZED");
+}
+
+#[test]
+fn tail_follow_streams_checkpoints_and_trace_changes() {
+    use std::io::{BufRead, BufReader};
+
+    let root = tempdir("tailf");
+    let (_, work) = repo(&root);
+    let m = Machine::new(&root, "a");
+    init(&m, &work);
+    fs::write(work.join("old.txt"), "1").unwrap();
+    m.hf(&work, &["checkpoint"]).ok();
+
+    let mut child = m
+        .cmd(&work)
+        .args(["tail", "-f", "-n", "0", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let v: Value = serde_json::from_str(&line.unwrap()).unwrap();
+            if tx.send(v).is_err() {
+                break;
+            }
+        }
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    m.hf(&work, &["trace", "close"]).ok();
+    fs::write(work.join("new.txt"), "1").unwrap();
+    m.hf_env(
+        &work,
+        &["checkpoint", "-m", "fresh", "--trace-name", "feat/new"],
+        &[("GHF_WRITER", "agent-1")],
+    )
+    .ok();
+
+    let mut seen = Vec::new();
+    while seen.len() < 3 {
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(v) => seen.push(v),
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let events: Vec<String> = seen
+        .iter()
+        .map(|e| {
+            let d = &e["data"];
+            match d["event"].as_str().unwrap() {
+                "trace" => format!(
+                    "{} {}",
+                    d["trace"]["name"].as_str().unwrap_or("-"),
+                    d["change"]
+                ),
+                _ => format!("checkpoint {}", d["checkpoint"]["message"]),
+            }
+        })
+        .collect();
+    // -n 0 skips history; the old trace closing and the new one opening
+    // arrive in order, the opening before its first checkpoint.
+    assert_eq!(
+        events,
+        [
+            "- \"closed\"",
+            "feat/new \"opened\"",
+            "checkpoint \"fresh\""
+        ],
+        "{seen:?}"
     );
 }
