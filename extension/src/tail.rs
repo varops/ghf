@@ -311,11 +311,21 @@ fn trace_label(t: Option<&TraceRecord>, id: &str) -> String {
     })
 }
 
-/// `HH:MM:SS` in UTC.
+/// `HH:MM:SS` in local time (`TZ`, else the system zone).
 fn clock(ms: i64) -> String {
-    let t = std::time::UNIX_EPOCH + Duration::from_millis(ms.max(0) as u64);
-    let s = humantime::format_rfc3339_seconds(t).to_string();
-    s.get(11..19).unwrap_or(&s).to_owned()
+    clock_in(ms, &chrono::Local)
+}
+
+fn clock_in<Tz: chrono::TimeZone>(ms: i64, tz: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    match tz.timestamp_millis_opt(ms) {
+        chrono::LocalResult::Single(t) | chrono::LocalResult::Ambiguous(t, _) => {
+            t.format("%H:%M:%S").to_string()
+        }
+        chrono::LocalResult::None => "--:--:--".to_owned(),
+    }
 }
 
 /// Pad or cut to exactly `w` visible characters.
@@ -410,8 +420,9 @@ mod tests {
     }
 
     #[test]
-    fn clock_is_utc_hh_mm_ss() {
-        assert_eq!(clock(0), "00:00:00");
-        assert_eq!(clock(3_723_000), "01:02:03");
+    fn clock_uses_the_given_zone() {
+        assert_eq!(clock_in(3_723_000, &chrono::Utc), "01:02:03");
+        let tokyo = chrono::FixedOffset::east_opt(9 * 3600).unwrap();
+        assert_eq!(clock_in(3_723_000, &tokyo), "10:02:03");
     }
 }

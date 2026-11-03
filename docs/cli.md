@@ -281,7 +281,7 @@ Prints the last N checkpoints (default 10) from every trace in the repository, o
 - **`-f`** keeps running and prints new checkpoints as they land, plus lines for traces that open, close, are finalized or are pruned. Traces older than the start of `tail` that a sync pulls in are not announced. Within one poll, events print in time order.
 - **`--trace`** takes a trace id, an id prefix or a trace name. **`--author`** matches the start of the author, so `claude-code` matches `claude-code:<session>`. **`--annotation`** is repeatable. With `--author` or `--annotation`, trace lines are left out.
 - **`--stat`** lists the changed paths under each checkpoint.
-- **Human output:** `HH:MM:SS` in UTC, author, trace name (or the end of its id), `#seq`, `+added ~modified -deleted`, annotations and the message's first line. Colour is on only for a terminal and when `NO_COLOR` is unset.
+- **Human output:** `HH:MM:SS` in local time (`TZ` if set), author, trace name (or the end of its id), `#seq`, `+added ~modified -deleted`, annotations and the message's first line. Colour is on only for a terminal and when `NO_COLOR` is unset.
 
 With `--json`, it prints one envelope per line: `{"event": "checkpoint", "checkpoint", "trace": {id, name}}` or `{"event": "trace", "change": "opened|closed|finalized|pruned", "trace"}`.
 
