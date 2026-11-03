@@ -103,6 +103,27 @@ pub enum Command {
         #[arg(long, default_value = "30s")]
         max_wait: String,
     },
+    /// Show recent checkpoints from every trace in this repository; -f keeps following.
+    Tail {
+        /// Keep running and print checkpoints and trace changes as they land.
+        #[arg(short, long)]
+        follow: bool,
+        /// How many existing checkpoints to show first.
+        #[arg(short = 'n', long, default_value_t = 10)]
+        lines: usize,
+        /// Only this trace (id, id prefix or name).
+        #[arg(long)]
+        trace: Option<String>,
+        /// Only authors starting with this, e.g. `claude-code`.
+        #[arg(long)]
+        author: Option<String>,
+        /// Only checkpoints with this annotation, e.g. tests=fail. Repeatable.
+        #[arg(long = "annotation", value_name = "KEY=VALUE")]
+        annotations: Vec<String>,
+        /// List the changed paths under each checkpoint.
+        #[arg(long)]
+        stat: bool,
+    },
     /// Hook entry point called by an agent harness (reads its payload on stdin).
     Hook { harness: Harness },
     /// Install or print the agent skill that teaches ghf workflows.
@@ -260,6 +281,7 @@ impl Command {
             Self::Prune { .. } => "prune",
             Self::Hook { .. } => "hook",
             Self::Watch { .. } => "watch",
+            Self::Tail { .. } => "tail",
             Self::Skill(SkillCommand::Install { .. }) => "skill install",
             Self::Skill(SkillCommand::Show) => "skill show",
             Self::Hooks(h) => match h {
@@ -291,6 +313,7 @@ impl Command {
             Self::Status
                 | Self::Hook { .. }
                 | Self::Watch { .. }
+                | Self::Tail { .. }
                 | Self::Skill(SkillCommand::Show)
                 | Self::Hooks(HooksCommand::Status { .. })
                 | Self::Trace(

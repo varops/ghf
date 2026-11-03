@@ -274,6 +274,17 @@ Runs until interrupted. It checkpoints after file changes settle, catching write
 
 With `--json`, it prints one envelope per checkpoint, one per line.
 
+### `tail [-f] [-n N] [--trace T] [--author A] [--annotation K=V]... [--stat]`
+
+Prints the last N checkpoints (default 10) from every trace in the repository, oldest first. It reads the local store, which all worktrees share, so it shows every agent working in this repository on this machine, plus whatever `sync` has pulled in. It only reads.
+
+- **`-f`** keeps running and prints new checkpoints as they land, plus lines for traces that open, close, are finalized or are pruned. Traces older than the start of `tail` that a sync pulls in are not announced. Within one poll, events print in time order.
+- **`--trace`** takes a trace id, an id prefix or a trace name. **`--author`** matches the start of the author, so `claude-code` matches `claude-code:<session>`. **`--annotation`** is repeatable. With `--author` or `--annotation`, trace lines are left out.
+- **`--stat`** lists the changed paths under each checkpoint.
+- **Human output:** `HH:MM:SS` in UTC, author, trace name (or the end of its id), `#seq`, `+added ~modified -deleted`, annotations and the message's first line. Colour is on only for a terminal and when `NO_COLOR` is unset.
+
+With `--json`, it prints one envelope per line: `{"event": "checkpoint", "checkpoint", "trace": {id, name}}` or `{"event": "trace", "change": "opened|closed|finalized|pruned", "trace"}`.
+
 ### `hook claude-code|cursor`
 
 The entry point the hooks call. It reads the harness payload on stdin and checkpoints the repository the edit happened in. The writer is `claude-code:<session_id>` or `cursor:<conversation_id>`. Outside a ghf-enabled repository it does nothing.

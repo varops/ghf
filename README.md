@@ -22,6 +22,7 @@ ghf sits next to Git, not inside it. It writes nothing into commits, messages, r
 | Hand work to another machine | `ghf sync` here; `ghf trace restore <id>` there |
 | Try two approaches from one point | `ghf trace fork <id>` once per attempt |
 | Show a human what was tried | `ghf trace log` and `ghf trace diff <a> <b>` |
+| Watch every agent work, live | `ghf tail -f` |
 | Survive a crashed worker | A checkpoint is acknowledged only after it is durable locally; sync catches up later |
 
 New here? Start with the [user guide](docs/guide.md).
@@ -71,6 +72,7 @@ ghf skill install               # teach the agent the workflow
 ghf checkpoint -m "parser passes" --annotate tests=pass
 ghf status
 ghf trace log
+ghf tail -f                                # every agent's checkpoints, live
 ghf trace diff @~2 @
 ghf trace restore @~2                      # into a new worktree
 ghf trace restore @~2 --in-place           # refused if anything is uncaptured
