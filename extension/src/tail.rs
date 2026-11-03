@@ -426,3 +426,65 @@ mod tests {
         assert_eq!(clock_in(3_723_000, &tokyo), "10:02:03");
     }
 }
+
+/// Known gaps: behavior we know is wrong, pinned by tests that pass while
+/// the gap is open.
+///
+/// - Each test asserts what the code does today; its comment says what it
+///   should do and how to fix it.
+/// - A fix makes the test fail. Then flip the assertion to the correct
+///   behavior and move the test next to the feature. A gap closes only on a
+///   real pass; never delete or weaken a gap test to get green.
+/// - Name them `gap_<what is wrong>`.
+#[cfg(test)]
+mod known_gaps {
+    use ghf_proto::CheckpointRecord;
+    use serde_json::json;
+
+    use crate::store::Store;
+
+    fn ck(id: &str, seq: i64) -> CheckpointRecord {
+        serde_json::from_value(json!({
+            "id": id, "trace_id": "tr_1", "seq": seq, "context_id": "wc_1",
+            "created_at": seq, "author": "agent", "root": "0".repeat(64),
+            "files": 0, "bytes": 0
+        }))
+        .unwrap()
+    }
+
+    /// Gap: `tail -f` follows the store by SQLite row id, and SQLite hands
+    /// the highest row id out again once that row is deleted. If pruning
+    /// deletes the newest checkpoint while a tail runs, the next checkpoint
+    /// gets the same row id and the tail never prints it. Display only; the
+    /// checkpoint itself is stored correctly.
+    ///
+    /// Should: every checkpoint inserted after the tail's last read is seen.
+    /// Fix: give `checkpoints` a never-reused sequence (an AUTOINCREMENT key
+    /// or a counter in `kv`, set on insert) and follow that instead.
+    #[test]
+    fn gap_follow_misses_a_checkpoint_that_reuses_a_deleted_row_id() {
+        let dir = std::env::temp_dir().join(format!("ghf-gap-rowid-{}", ghf_proto::id::now_ms()));
+        let store = Store::open(&dir).unwrap();
+        store.insert_checkpoint(&ck("ck_a", 1), false).unwrap();
+        store.insert_checkpoint(&ck("ck_b", 2), false).unwrap();
+        // The tail has read up to the newest row.
+        let last = store.checkpoints_after(0).unwrap().last().unwrap().0;
+        // Pruning removes that newest row; then a new checkpoint lands.
+        store
+            .db
+            .execute("DELETE FROM checkpoints WHERE id = 'ck_b'", [])
+            .unwrap();
+        store.insert_checkpoint(&ck("ck_c", 3), false).unwrap();
+        let seen: Vec<String> = store
+            .checkpoints_after(last)
+            .unwrap()
+            .into_iter()
+            .map(|(_, c)| c.id)
+            .collect();
+        assert!(
+            seen.is_empty(), // should be ["ck_c"]
+            "{seen:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
