@@ -427,17 +427,8 @@ mod tests {
     }
 }
 
-/// Known gaps: behavior we know is wrong, pinned by tests that pass while
-/// the gap is open.
-///
-/// - Each test asserts what the code does today; its comment says what it
-///   should do and how to fix it.
-/// - A fix makes the test fail. Then flip the assertion to the correct
-///   behavior and move the test next to the feature. A gap closes only on a
-///   real pass; never delete or weaken a gap test to get green.
-/// - Name them `gap_<what is wrong>`.
 #[cfg(test)]
-mod known_gaps {
+mod follow {
     use ghf_proto::CheckpointRecord;
     use serde_json::json;
 
@@ -452,38 +443,59 @@ mod known_gaps {
         .unwrap()
     }
 
-    /// Gap: `tail -f` follows the store by SQLite row id, and SQLite hands
-    /// the highest row id out again once that row is deleted. If pruning
-    /// deletes the newest checkpoint while a tail runs, the next checkpoint
-    /// gets the same row id and the tail never prints it. Display only; the
-    /// checkpoint itself is stored correctly.
-    ///
-    /// Should: every checkpoint inserted after the tail's last read is seen.
-    /// Fix: give `checkpoints` a never-reused sequence (an AUTOINCREMENT key
-    /// or a counter in `kv`, set on insert) and follow that instead.
+    fn store(tag: &str) -> (std::path::PathBuf, Store) {
+        let dir = std::env::temp_dir().join(format!(
+            "ghf-follow-{tag}-{}-{}",
+            std::process::id(),
+            ghf_proto::id::now_ms()
+        ));
+        let s = Store::open(&dir).unwrap();
+        (dir, s)
+    }
+
+    fn ids(v: Vec<(i64, CheckpointRecord)>) -> Vec<String> {
+        v.into_iter().map(|(_, c)| c.id).collect()
+    }
+
+    /// SQLite reuses the highest rowid once that row is deleted. Following by
+    /// arrival number still sees a checkpoint that lands after pruning
+    /// removed the newest one.
     #[test]
-    fn gap_follow_misses_a_checkpoint_that_reuses_a_deleted_row_id() {
-        let dir = std::env::temp_dir().join(format!("ghf-gap-rowid-{}", ghf_proto::id::now_ms()));
-        let store = Store::open(&dir).unwrap();
-        store.insert_checkpoint(&ck("ck_a", 1), false).unwrap();
-        store.insert_checkpoint(&ck("ck_b", 2), false).unwrap();
-        // The tail has read up to the newest row.
-        let last = store.checkpoints_after(0).unwrap().last().unwrap().0;
-        // Pruning removes that newest row; then a new checkpoint lands.
-        store
-            .db
-            .execute("DELETE FROM checkpoints WHERE id = 'ck_b'", [])
+    fn sees_a_checkpoint_after_the_newest_was_deleted() {
+        let (dir, s) = store("reuse");
+        s.insert_checkpoint(&ck("ck_a", 1), false).unwrap();
+        s.insert_checkpoint(&ck("ck_b", 2), false).unwrap();
+        let last = s.checkpoints_after(0).unwrap().last().unwrap().0;
+        s.db.execute("DELETE FROM checkpoints WHERE id = 'ck_b'", [])
             .unwrap();
-        store.insert_checkpoint(&ck("ck_c", 3), false).unwrap();
-        let seen: Vec<String> = store
-            .checkpoints_after(last)
-            .unwrap()
-            .into_iter()
-            .map(|(_, c)| c.id)
-            .collect();
-        assert!(
-            seen.is_empty(), // should be ["ck_c"]
-            "{seen:?}"
+        s.insert_checkpoint(&ck("ck_c", 3), false).unwrap();
+        assert_eq!(ids(s.checkpoints_after(last).unwrap()), ["ck_c"]);
+        // A repeated insert (sync pulling a known checkpoint) is not news.
+        s.insert_checkpoint(&ck("ck_c", 3), false).unwrap();
+        assert_eq!(ids(s.checkpoints_after(0).unwrap()), ["ck_a", "ck_c"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A store written before arrival numbers existed is backfilled once,
+    /// in the order its checkpoints were stored.
+    #[test]
+    fn older_stores_are_backfilled() {
+        let (dir, s) = store("backfill");
+        // Make it look like a store from before this change.
+        s.db.execute_batch(
+            "DROP TRIGGER checkpoint_arrived; DROP TRIGGER checkpoint_removed;
+             DELETE FROM checkpoint_arrivals; DELETE FROM kv WHERE key = 'arrivals_backfilled';",
+        )
+        .unwrap();
+        s.insert_checkpoint(&ck("ck_old1", 1), false).unwrap();
+        s.insert_checkpoint(&ck("ck_old2", 2), false).unwrap();
+        drop(s);
+        let s = Store::open(&dir).unwrap();
+        assert_eq!(ids(s.checkpoints_after(0).unwrap()), ["ck_old1", "ck_old2"]);
+        s.insert_checkpoint(&ck("ck_new", 3), false).unwrap();
+        assert_eq!(
+            ids(s.checkpoints_after(0).unwrap()),
+            ["ck_old1", "ck_old2", "ck_new"]
         );
         let _ = std::fs::remove_dir_all(dir);
     }
