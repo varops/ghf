@@ -6,6 +6,7 @@
 //! plus anything `ghf sync` pulls in. It only reads: no lease, no capture,
 //! no sync.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{IsTerminal, Write};
 use std::time::Duration;
@@ -186,7 +187,7 @@ fn emit_checkpoint(
     let mut line = format!(
         "{}  {}  {}  {}  {}",
         p.dim(&clock(c.created_at)),
-        p.color(author_color(&c.author), &fit(&c.author, AUTHOR_WIDTH)),
+        p.author(&c.author, &fit(&c.author, AUTHOR_WIDTH)),
         fit(&trace_label(t, &c.trace_id), TRACE_WIDTH),
         p.dim(&format!("#{:<4}", c.seq)),
         counts(p, c),
@@ -329,26 +330,45 @@ fn fit(s: &str, w: usize) -> String {
     }
 }
 
-/// A stable color per author, avoiding red and green (used for test results).
-fn author_color(author: &str) -> &'static str {
-    const PALETTE: [&str; 8] = ["36", "33", "35", "34", "96", "95", "93", "94"];
-    let h = author.bytes().fold(0xcbf29ce484222325u64, |h, b| {
-        (h ^ b as u64).wrapping_mul(0x100000001b3)
-    });
-    PALETTE[(h % PALETTE.len() as u64) as usize]
-}
+/// Author colors: six clearly different hues, none red or green (those
+/// mark test results). Bright variants would read as the same color.
+const AUTHOR_COLORS: [&str; 6] = ["36", "33", "35", "34", "38;5;208", "38;5;205"];
 
 /// ANSI colors, on only for a terminal and when `NO_COLOR` is unset.
-struct Paint(bool);
+struct Paint {
+    on: bool,
+    /// Authors in order of first appearance; each takes the next color, so
+    /// the first six authors on screen never share one.
+    authors: RefCell<Vec<String>>,
+}
 
 impl Paint {
     fn new(json: bool) -> Self {
         let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
-        Self(!json && !no_color && std::io::stdout().is_terminal())
+        Self {
+            on: !json && !no_color && std::io::stdout().is_terminal(),
+            authors: RefCell::default(),
+        }
+    }
+
+    fn author_color(&self, author: &str) -> &'static str {
+        let mut seen = self.authors.borrow_mut();
+        let i = match seen.iter().position(|a| a == author) {
+            Some(i) => i,
+            None => {
+                seen.push(author.to_owned());
+                seen.len() - 1
+            }
+        };
+        AUTHOR_COLORS[i % AUTHOR_COLORS.len()]
+    }
+
+    fn author(&self, author: &str, s: &str) -> String {
+        self.color(self.author_color(author), s)
     }
 
     fn color(&self, code: &str, s: &str) -> String {
-        if self.0 {
+        if self.on {
             format!("\x1b[{code}m{s}\x1b[0m")
         } else {
             s.to_owned()
@@ -372,11 +392,21 @@ mod tests {
     }
 
     #[test]
-    fn author_colors_are_stable_and_never_red_or_green() {
-        assert_eq!(author_color("claude-code:1"), author_color("claude-code:1"));
-        for a in ["a", "b", "claude-code:x", "cursor:y", "watch:ran"] {
-            assert!(!["31", "32"].contains(&author_color(a)));
+    fn authors_get_distinct_colors_in_order_of_appearance() {
+        let p = Paint::new(true);
+        let a = p.author_color("claude-code:1");
+        let b = p.author_color("cursor:2");
+        assert_ne!(a, b);
+        assert_eq!(p.author_color("claude-code:1"), a);
+        for author in ["c", "d", "e", "f"] {
+            assert!(!["31", "32"].contains(&p.author_color(author)));
         }
+        // Six authors, six different colors.
+        let used: std::collections::HashSet<_> = ["claude-code:1", "cursor:2", "c", "d", "e", "f"]
+            .iter()
+            .map(|x| p.author_color(x))
+            .collect();
+        assert_eq!(used.len(), 6);
     }
 
     #[test]
