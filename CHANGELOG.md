@@ -6,6 +6,10 @@
 
 - **`ghf tail`.** Shows the latest checkpoints from every trace in the repository, across all worktrees on this machine plus anything a sync pulled in. `-f` keeps following and also prints traces opening, closing and being finalized. Lines show the local time, the author (one colour per author), the trace, the change counts, `tests=pass`/`fail` in green or red, and the message. Filter with `--trace`, `--author` and `--annotation`, list changed paths with `--stat`, or stream one envelope per line with `--json`. Colour turns off when the output is not a terminal or `NO_COLOR` is set.
 
+### Changed
+
+- **Local store.** A `checkpoint_arrivals` table, kept in step by triggers, records the order checkpoints reached the store. `tail -f` follows it, so it no longer misses a checkpoint stored right after pruning removed the newest one. Existing stores are filled in once, on first open.
+
 ## 0.1.0-rc.2 — 2026-10-19
 
 ### Added

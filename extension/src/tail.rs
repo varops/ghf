@@ -426,3 +426,77 @@ mod tests {
         assert_eq!(clock_in(3_723_000, &tokyo), "10:02:03");
     }
 }
+
+#[cfg(test)]
+mod follow {
+    use ghf_proto::CheckpointRecord;
+    use serde_json::json;
+
+    use crate::store::Store;
+
+    fn ck(id: &str, seq: i64) -> CheckpointRecord {
+        serde_json::from_value(json!({
+            "id": id, "trace_id": "tr_1", "seq": seq, "context_id": "wc_1",
+            "created_at": seq, "author": "agent", "root": "0".repeat(64),
+            "files": 0, "bytes": 0
+        }))
+        .unwrap()
+    }
+
+    fn store(tag: &str) -> (std::path::PathBuf, Store) {
+        let dir = std::env::temp_dir().join(format!(
+            "ghf-follow-{tag}-{}-{}",
+            std::process::id(),
+            ghf_proto::id::now_ms()
+        ));
+        let s = Store::open(&dir).unwrap();
+        (dir, s)
+    }
+
+    fn ids(v: Vec<(i64, CheckpointRecord)>) -> Vec<String> {
+        v.into_iter().map(|(_, c)| c.id).collect()
+    }
+
+    /// SQLite reuses the highest rowid once that row is deleted. Following by
+    /// arrival number still sees a checkpoint that lands after pruning
+    /// removed the newest one.
+    #[test]
+    fn sees_a_checkpoint_after_the_newest_was_deleted() {
+        let (dir, s) = store("reuse");
+        s.insert_checkpoint(&ck("ck_a", 1), false).unwrap();
+        s.insert_checkpoint(&ck("ck_b", 2), false).unwrap();
+        let last = s.checkpoints_after(0).unwrap().last().unwrap().0;
+        s.db.execute("DELETE FROM checkpoints WHERE id = 'ck_b'", [])
+            .unwrap();
+        s.insert_checkpoint(&ck("ck_c", 3), false).unwrap();
+        assert_eq!(ids(s.checkpoints_after(last).unwrap()), ["ck_c"]);
+        // A repeated insert (sync pulling a known checkpoint) is not news.
+        s.insert_checkpoint(&ck("ck_c", 3), false).unwrap();
+        assert_eq!(ids(s.checkpoints_after(0).unwrap()), ["ck_a", "ck_c"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A store written before arrival numbers existed is backfilled once,
+    /// in the order its checkpoints were stored.
+    #[test]
+    fn older_stores_are_backfilled() {
+        let (dir, s) = store("backfill");
+        // Make it look like a store from before this change.
+        s.db.execute_batch(
+            "DROP TRIGGER checkpoint_arrived; DROP TRIGGER checkpoint_removed;
+             DELETE FROM checkpoint_arrivals; DELETE FROM kv WHERE key = 'arrivals_backfilled';",
+        )
+        .unwrap();
+        s.insert_checkpoint(&ck("ck_old1", 1), false).unwrap();
+        s.insert_checkpoint(&ck("ck_old2", 2), false).unwrap();
+        drop(s);
+        let s = Store::open(&dir).unwrap();
+        assert_eq!(ids(s.checkpoints_after(0).unwrap()), ["ck_old1", "ck_old2"]);
+        s.insert_checkpoint(&ck("ck_new", 3), false).unwrap();
+        assert_eq!(
+            ids(s.checkpoints_after(0).unwrap()),
+            ["ck_old1", "ck_old2", "ck_new"]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

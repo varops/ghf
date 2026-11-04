@@ -81,7 +81,27 @@ CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+-- The order checkpoints reached this store, for `tail -f`. AUTOINCREMENT
+-- never hands a number out twice, unlike rowid, which SQLite reuses once
+-- the newest row is deleted. Triggers keep it in step with every insert
+-- and delete, from any version of ghf that opens the store.
+CREATE TABLE IF NOT EXISTS checkpoint_arrivals (
+    n INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE
+);
+CREATE TRIGGER IF NOT EXISTS checkpoint_arrived AFTER INSERT ON checkpoints
+BEGIN
+    INSERT OR IGNORE INTO checkpoint_arrivals (id) VALUES (NEW.id);
+END;
+CREATE TRIGGER IF NOT EXISTS checkpoint_removed AFTER DELETE ON checkpoints
+BEGIN
+    DELETE FROM checkpoint_arrivals WHERE id = OLD.id;
+END;
 "#;
+
+/// Fills `checkpoint_arrivals` once for checkpoints stored before it existed.
+const ARRIVALS_BACKFILL: &str =
+    "INSERT OR IGNORE INTO checkpoint_arrivals (id) SELECT id FROM checkpoints ORDER BY rowid";
 
 pub struct Store {
     pub db: Connection,
@@ -138,7 +158,14 @@ impl Store {
         // WAL checkpoints are moved off the capture path; see `maintain`.
         db.pragma_update(None, "wal_autocheckpoint", 0)?;
         db.execute_batch(SCHEMA)?;
-        Ok(Self { db, dir })
+        let store = Self { db, dir };
+        if store.kv_get("arrivals_backfilled")?.is_none() {
+            store.tx(|| {
+                store.db.execute(ARRIVALS_BACKFILL, [])?;
+                store.kv_set("arrivals_backfilled", "1")
+            })?;
+        }
+        Ok(store)
     }
 
     /// Fold the write-ahead log back into the database once it grows past
@@ -508,12 +535,13 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Checkpoints in the order they reached this store, with their row ids,
-    /// starting after row `after`. Used to follow the store as it grows.
+    /// Checkpoints in the order they reached this store, each with its
+    /// arrival number, starting after arrival `after`. Arrival numbers are
+    /// never reused, so following the store this way misses nothing.
     pub fn checkpoints_after(&self, after: i64) -> Result<Vec<(i64, CheckpointRecord)>> {
-        let mut st = self
-            .db
-            .prepare("SELECT rowid, record FROM checkpoints WHERE rowid > ?1 ORDER BY rowid")?;
+        let mut st = self.db.prepare(
+            "SELECT a.n, c.record FROM checkpoint_arrivals a JOIN checkpoints c ON c.id = a.id WHERE a.n > ?1 ORDER BY a.n",
+        )?;
         let rows = st.query_map([after], |r| {
             let json: String = r.get(1)?;
             let c = serde_json::from_str(&json).map_err(|e| {
