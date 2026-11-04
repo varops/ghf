@@ -12,7 +12,7 @@ ghf sits next to Git, not inside it. It writes nothing into commits, messages, r
 - **Git** holds accepted history.
 - **ghf** holds recoverable working history, with its own retention, permissions and sync.
 
-**Status: 0.1.0-rc.2.** The full MVP is implemented: capture, sync, restore and apply, and the trace lifecycle.
+**Status: 0.1.0-rc.3.** The full MVP is implemented: capture, sync, restore and apply, and the trace lifecycle.
 
 ## What it does for a fleet
 
