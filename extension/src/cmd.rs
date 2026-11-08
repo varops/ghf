@@ -313,6 +313,13 @@ pub fn status(env: &Env) -> Result<Out> {
             "{rejected} checkpoint(s) were refused by the server and exist only on this machine"
         ));
     }
+    let refused_holds = ws.store.refused_holds_since(now - 7 * DAY_MS)?;
+    for h in &refused_holds {
+        warnings.push(format!(
+            "the server refused to {} hold {:?} on trace {}: {} ({})",
+            h.op, h.name, h.trace, h.message, h.code
+        ));
+    }
     if let Some(e) = &last_sync_error {
         warnings.push(format!(
             "last sync failed: {} ({})",
@@ -354,6 +361,7 @@ pub fn status(env: &Env) -> Result<Out> {
             "latest_checkpoint": latest,
             "unsynced": unsynced,
             "rejected": rejected,
+            "refused_holds": refused_holds,
             "last_sync_at": last_sync_at,
             "last_sync_error": last_sync_error,
             "capture_failures": failures.iter().map(|(at, code, msg, strict)| json!({
@@ -1322,6 +1330,13 @@ pub fn trace_hold(
     let ws = env.ws()?;
     let row = resolve_trace(&ws, Some(&trace), env.prompt())?;
     let mut t = row.record;
+    if t.state == TraceState::Pruned {
+        fail!(
+            TraceState,
+            "trace {} is pruned; holds no longer apply",
+            t.id
+        );
+    }
     if name.is_empty()
         || name.len() > 64
         || !name

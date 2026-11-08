@@ -45,6 +45,16 @@ CREATE TABLE IF NOT EXISTS hold_ops (
     place INTEGER NOT NULL,
     expires_at INTEGER
 );
+-- Hold operations the server refused for good, kept for `status`.
+CREATE TABLE IF NOT EXISTS refused_holds (
+    id INTEGER PRIMARY KEY,
+    at INTEGER NOT NULL,
+    trace_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    place INTEGER NOT NULL,
+    code TEXT NOT NULL,
+    message TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS failures (
     id INTEGER PRIMARY KEY,
     at INTEGER NOT NULL,
@@ -117,6 +127,18 @@ pub struct TraceRow {
 
 /// A pending hold operation: (op id, trace, name, place, expires_at).
 pub type HoldOp = (i64, String, String, bool, Option<i64>);
+
+/// A hold operation the server refused permanently.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RefusedHold {
+    pub trace: String,
+    pub name: String,
+    /// `place` or `release`.
+    pub op: &'static str,
+    pub code: String,
+    pub message: String,
+    pub at: i64,
+}
 
 /// Where a checkpoint stands with the server. Stored in
 /// `checkpoints.synced`; [`SyncState::code`] and [`SyncState::from_code`]
@@ -718,6 +740,50 @@ impl Store {
         self.db
             .execute("DELETE FROM hold_ops WHERE id = ?1", [id])?;
         Ok(())
+    }
+
+    /// Drop a hold operation the server refused for good, and remember the
+    /// refusal for `status`.
+    pub fn refuse_hold_op(&self, op: &HoldOp, code: &str, message: &str) -> Result<RefusedHold> {
+        let (id, trace, name, place, _) = op;
+        let at = ghf_proto::id::now_ms();
+        self.tx(|| {
+            self.db.execute(
+                "INSERT INTO refused_holds (at, trace_id, name, place, code, message) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![at, trace, name, *place as i64, code, message],
+            )?;
+            self.remove_hold_op(*id)
+        })?;
+        Ok(RefusedHold {
+            trace: trace.clone(),
+            name: name.clone(),
+            op: if *place { "place" } else { "release" },
+            code: code.to_owned(),
+            message: message.to_owned(),
+            at,
+        })
+    }
+
+    /// Refused hold operations since `since` (unix ms), newest first.
+    pub fn refused_holds_since(&self, since: i64) -> Result<Vec<RefusedHold>> {
+        let mut st = self.db.prepare(
+            "SELECT trace_id, name, place, code, message, at FROM refused_holds WHERE at >= ?1 ORDER BY at DESC LIMIT 20",
+        )?;
+        let rows = st.query_map([since], |r| {
+            Ok(RefusedHold {
+                trace: r.get(0)?,
+                name: r.get(1)?,
+                op: if r.get::<_, i64>(2)? != 0 {
+                    "place"
+                } else {
+                    "release"
+                },
+                code: r.get(3)?,
+                message: r.get(4)?,
+                at: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     // -- failures -----------------------------------------------------------------

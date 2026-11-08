@@ -5,6 +5,7 @@
 ### Fixed
 
 - **Refused checkpoints survive `prune`.** Local prune dropped a trace the server had pruned even when it held checkpoints the server refused, so they were lost although they were promised to stay restorable. A trace with pending or refused checkpoints is now kept.
+- **A refused hold no longer blocks sync.** Pinning or holding a trace that was pruned on the server, or that the server does not know, made every later `sync` fail at that hold. Such a hold is now dropped and reported in the new `refused_holds` field of `sync` and `status`. Holds on a trace this machine already knows is pruned are refused with `E_TRACE_STATE`.
 
 ## 0.1.0-rc.3 — 2026-11-04
 

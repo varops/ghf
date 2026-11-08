@@ -310,6 +310,16 @@ pub struct SyncReport {
     pub pending: i64,
     /// Checkpoints the server refused permanently; kept locally, not retried.
     pub rejected: Vec<String>,
+    /// Hold operations the server refused permanently; dropped, not retried.
+    pub refused_holds: Vec<crate::store::RefusedHold>,
+}
+
+/// Errors that will not go away by retrying the same request.
+fn permanent(code: ErrorCode) -> bool {
+    matches!(
+        code,
+        ErrorCode::TraceState | ErrorCode::NotFound | ErrorCode::Usage
+    )
 }
 
 fn client_id(ws: &Workspace) -> Result<String> {
@@ -446,12 +456,7 @@ pub fn sync(ws: &Workspace, remote: &Remote) -> Result<SyncReport> {
             Ok(()) => {}
             // A permanent refusal (for example, its trace was pruned on the
             // server) must not block every later checkpoint.
-            Err(f)
-                if matches!(
-                    f.code,
-                    ErrorCode::TraceState | ErrorCode::NotFound | ErrorCode::Usage
-                ) =>
-            {
+            Err(f) if permanent(f.code) => {
                 ws.store.tx(|| {
                     ws.store.set_sync_state(&ck.id, SyncState::Refused)?;
                     ws.store.record_failure(
@@ -474,14 +479,26 @@ pub fn sync(ws: &Workspace, remote: &Remote) -> Result<SyncReport> {
         report.pushed_checkpoints += 1;
     }
 
-    for (op, trace, name, place, expires) in ws.store.hold_ops()? {
-        if place {
-            remote.put_hold(&trace, &name, expires)?;
+    for op in ws.store.hold_ops()? {
+        let (id, trace, name, place, expires) = &op;
+        let result = if *place {
+            remote.put_hold(trace, name, *expires)
         } else {
-            remote.delete_hold(&trace, &name)?;
+            remote.delete_hold(trace, name)
+        };
+        match result {
+            Ok(()) => {
+                ws.store.remove_hold_op(*id)?;
+                report.hold_ops += 1;
+            }
+            // A pruned or unknown trace will never take this hold; drop it
+            // so it does not block every later sync.
+            Err(f) if permanent(f.code) => {
+                let refused = ws.store.refuse_hold_op(&op, f.code.as_str(), &f.message)?;
+                report.refused_holds.push(refused);
+            }
+            Err(f) => return Err(f),
         }
-        ws.store.remove_hold_op(op)?;
-        report.hold_ops += 1;
     }
 
     remote.report_pending(&client, pending_traces(ws)?)?;

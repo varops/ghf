@@ -128,7 +128,7 @@ Data:
 
 ```text
 {repository_root, context, capture_mode, trace, latest_checkpoint, unsynced, rejected,
- last_sync_at, last_sync_error, capture_failures[], server, warnings[]}
+ refused_holds[], last_sync_at, last_sync_error, capture_failures[], server, warnings[]}
 ```
 
 `warnings` includes:
@@ -154,13 +154,14 @@ Pushes traces, checkpoints and holds, then pulls metadata from other machines.
 
 - **Content is lazy:** it is fetched on restore, diff or apply.
 - **Refused checkpoints:** a checkpoint the server refuses permanently (for example, its trace was pruned there) is listed in `rejected`. It stays restorable on this machine and no longer blocks later uploads.
+- **Refused holds:** a hold change the server refuses permanently (`E_TRACE_STATE`, `E_NOT_FOUND` or `E_USAGE`, for example because its trace was pruned there) is dropped and listed in `refused_holds` as `{trace, name, op, code, message, at}`, where `op` is `place` or `release`. `status` reports it for 7 days. Other errors stop the sync and the hold is retried next time.
 - **On failure:** `data.pending` holds the count still to push.
 
 Data:
 
 ```text
 {pushed_traces, pushed_checkpoints, pushed_objects, pushed_bytes, hold_ops,
- pulled_traces, pulled_checkpoints, pending, rejected[]}
+ pulled_traces, pulled_checkpoints, pending, rejected[], refused_holds[]}
 ```
 
 ### `trust [URL]` · `login [--server URL]`
@@ -244,7 +245,7 @@ Data: `{trace, changed}`.
 
 ### `trace pin|unpin TRACE` · `trace hold TRACE --name N [--expires 7d]` · `trace release TRACE --name N`
 
-Holds stop pruning. `pin` is the hold named `pin`. Data: `{trace}`.
+Holds stop pruning. `pin` is the hold named `pin`. A pruned trace takes no holds: these commands refuse it with `E_TRACE_STATE`. Data: `{trace}`.
 
 ### `prune [--dry-run]`
 
