@@ -138,7 +138,7 @@ Data:
 - A failed sync.
 - Recent capture failures.
 - Traces close to the unfinalized cap.
-- A context that was replaced because the directory came from another path or machine.
+- A context that was replaced because the directory came from another path or machine. The old context's open trace is closed then, since nothing can write to it again.
 
 ### `checkpoint [-m MSG] [--annotate K=V]... [--trace-name NAME] [--force] [--takeover]`
 
@@ -258,7 +258,9 @@ Asks the server to prune this repository, then drops local copies of pruned trac
 - **Without a server,** it applies the `.ghf` `[retention]` policy locally.
 - **Checkpoints that exist only on this machine** are never dropped: those not yet synced, and those the server refused. A trace holding any of them keeps all its checkpoints, even after the server pruned it.
 
-Data: `{dry_run, server, local}`.
+- **Gone worktrees:** an open trace whose worktree was removed or moved away is closed first, and listed in `local.closed_orphans`. This covers worktree contexts created on this machine by this version of ghf or later; older ones are not recorded and stay open until closed by hand.
+
+Data: `{dry_run, server, local}`. `local` is `{pruned[], retained_checkpoints[], objects_deleted, bytes_freed, closed_orphans[]}`.
 
 ### `hooks install|uninstall|status HARNESS [--scope project|local|user]`
 

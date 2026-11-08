@@ -87,6 +87,13 @@ CREATE TABLE IF NOT EXISTS objects (
 CREATE TABLE IF NOT EXISTS remote_objects (
     id BLOB PRIMARY KEY
 ) WITHOUT ROWID;
+-- Worktree contexts created on this machine, so `prune` can tell when
+-- one is gone (its context file no longer names it).
+CREATE TABLE IF NOT EXISTS contexts (
+    id TEXT PRIMARY KEY,
+    git_dir TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -511,6 +518,57 @@ impl Store {
             "UPDATE traces SET writer = ?2, lease_at = ?3 WHERE id = ?1 AND (state = 'open' OR ?2 IS NULL)",
             params![trace_id, writer, lease_at],
         )?;
+        Ok(())
+    }
+
+    /// Close every open trace of `context_id` (a context that is gone), to
+    /// be pushed like any close. Returns their ids.
+    pub fn close_context_traces(&self, context_id: &str, at: i64) -> Result<Vec<String>> {
+        self.tx(|| {
+            let open: Vec<TraceRow> = {
+                let mut st = self.db.prepare(
+                    "SELECT record, writer, lease_at FROM traces WHERE context_id = ?1 AND state = 'open'",
+                )?;
+                let rows = st.query_map([context_id], Self::trace_from_row)?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            let mut closed = Vec::new();
+            for row in open {
+                let mut t = row.record;
+                if t.close(at)? {
+                    self.update_trace(&t, true)?;
+                    closed.push(t.id);
+                }
+            }
+            Ok(closed)
+        })
+    }
+
+    /// Remember a context created on this machine and where its context
+    /// file lives.
+    pub fn note_context(&self, id: &str, git_dir: &Path) -> Result<()> {
+        self.db.execute(
+            "INSERT OR IGNORE INTO contexts (id, git_dir, created_at) VALUES (?1, ?2, ?3)",
+            params![id, git_dir.to_string_lossy(), ghf_proto::id::now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Contexts created on this machine: (id, git dir).
+    pub fn contexts(&self) -> Result<Vec<(String, PathBuf)>> {
+        let mut st = self.db.prepare("SELECT id, git_dir FROM contexts")?;
+        let rows = st.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                PathBuf::from(r.get::<_, String>(1)?),
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn forget_context(&self, id: &str) -> Result<()> {
+        self.db
+            .execute("DELETE FROM contexts WHERE id = ?1", [id])?;
         Ok(())
     }
 

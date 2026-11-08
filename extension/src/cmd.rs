@@ -1419,6 +1419,7 @@ pub fn prune(env: &Env, dry_run: bool) -> Result<Out> {
 /// With a server, a trace holding pending or refused checkpoints is kept.
 fn prune_local(ws: &Workspace, dry_run: bool, has_server: bool) -> Result<Value> {
     let now = ghf_proto::id::now_ms();
+    let closed_orphans = close_orphans(ws, dry_run, now)?;
     let policy = policy(ws)?;
     let traces = ws.store.traces()?;
     let mut doomed = Vec::new();
@@ -1463,8 +1464,36 @@ fn prune_local(ws: &Workspace, dry_run: bool, has_server: bool) -> Result<Value>
     }
     let (objects_deleted, bytes) = if dry_run { (0, 0) } else { gc(ws)? };
     Ok(
-        json!({"pruned": pruned, "retained_checkpoints": keep, "objects_deleted": objects_deleted, "bytes_freed": bytes}),
+        json!({"pruned": pruned, "retained_checkpoints": keep, "objects_deleted": objects_deleted, "bytes_freed": bytes, "closed_orphans": closed_orphans}),
     )
+}
+
+/// Close the open traces of worktree contexts created on this machine that
+/// are gone: their worktree was removed or moved, so their context file no
+/// longer names them. Contexts created before ghf recorded them are not
+/// known and are left alone.
+fn close_orphans(ws: &Workspace, dry_run: bool, now: i64) -> Result<Vec<String>> {
+    let mut closed = Vec::new();
+    for (id, git_dir) in ws.store.contexts()? {
+        if id == ws.ctx.id || workspace::context_id_at(&git_dir).as_deref() == Some(&id) {
+            continue;
+        }
+        if dry_run {
+            closed.extend(
+                ws.store
+                    .traces()?
+                    .into_iter()
+                    .filter(|t| t.record.context_id == id && t.record.state == TraceState::Open)
+                    .map(|t| t.record.id),
+            );
+            continue;
+        }
+        ws.store.tx(|| {
+            closed.extend(ws.store.close_context_traces(&id, now)?);
+            ws.store.forget_context(&id)
+        })?;
+    }
+    Ok(closed)
 }
 
 /// Delete objects no remaining checkpoint references. Objects younger than

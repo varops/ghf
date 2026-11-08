@@ -35,6 +35,14 @@ pub fn ghf_dir(repo: &Repo) -> PathBuf {
     repo.git_dir.join("ghf")
 }
 
+/// The id in the context file under `git_dir`, if there is one.
+pub fn context_id_at(git_dir: &Path) -> Option<String> {
+    let text = fs::read_to_string(git_dir.join("ghf").join("context.json")).ok()?;
+    serde_json::from_str::<WorktreeContext>(&text)
+        .ok()
+        .map(|c| c.id)
+}
+
 impl Workspace {
     /// Open the worktree containing `cwd`. Fails with `E_NOT_INITIALIZED`
     /// when the repository has no `.ghf`.
@@ -53,7 +61,19 @@ impl Workspace {
 
     pub fn with_config(repo: Repo, cfg: RepoConfig) -> Result<Self> {
         let store = Store::open(&repo.common_dir)?;
-        let (ctx, replaced_context) = load_or_create_context(&repo)?;
+        let (ctx, created, replaced_context) = load_or_create_context(&repo)?;
+        if created {
+            store.tx(|| {
+                store.note_context(&ctx.id, &repo.git_dir)?;
+                // The old context is gone for good: nothing will write to
+                // its open trace again.
+                if let Some(old) = &replaced_context {
+                    store.close_context_traces(old, ghf_proto::id::now_ms())?;
+                    store.forget_context(old)?;
+                }
+                Ok(())
+            })?;
+        }
         Ok(Self {
             repo,
             cfg,
@@ -74,8 +94,9 @@ fn context_path(repo: &Repo) -> PathBuf {
 
 /// Load this worktree's context, or create one. A context whose recorded
 /// path or machine differs (a copied directory or cloned VM) is replaced so
-/// two live contexts never share an id.
-fn load_or_create_context(repo: &Repo) -> Result<(WorktreeContext, Option<String>)> {
+/// two live contexts never share an id. Returns the context, whether it was
+/// created, and the id it replaced.
+fn load_or_create_context(repo: &Repo) -> Result<(WorktreeContext, bool, Option<String>)> {
     let path = context_path(repo);
     let machine_id = config::machine_id()?;
     let root = crate::platform::canonicalize(&repo.root).unwrap_or_else(|_| repo.root.clone());
@@ -84,12 +105,12 @@ fn load_or_create_context(repo: &Repo) -> Result<(WorktreeContext, Option<String
         && let Ok(ctx) = serde_json::from_str::<WorktreeContext>(&text)
     {
         if ctx.path == root && ctx.machine_id == machine_id {
-            return Ok((ctx, None));
+            return Ok((ctx, false, None));
         }
         replaced = Some(ctx.id);
     }
     let ctx = new_context(repo, &root, machine_id)?;
-    Ok((ctx, replaced))
+    Ok((ctx, true, replaced))
 }
 
 pub fn new_context(repo: &Repo, root: &Path, machine_id: String) -> Result<WorktreeContext> {

@@ -239,3 +239,59 @@ fn a_losing_finalize_is_reported() {
     assert_eq!(t["abandoned"], true);
     assert_eq!(t["final_commit"], Value::Null);
 }
+
+fn trace_state(m: &Machine, dir: &Path, trace: &str) -> Value {
+    m.hf(dir, &["trace", "log", trace]).ok()["trace"]["state"].clone()
+}
+
+/// A worktree context that is gone leaves no open trace behind: one
+/// replaced because the directory moved, or one whose worktree was removed
+/// (noticed by `prune`).
+#[test]
+fn orphaned_open_traces_are_closed() {
+    let root = tempdir("orphans");
+    let (_, work) = repo(&root);
+    let m = Machine::new(&root, "a");
+    m.hf(&work, &["init"]).ok();
+
+    // The directory "moved": its context records another path.
+    fs::write(work.join("f.txt"), "1").unwrap();
+    let t1 = checkpoint(&m, &work)["trace_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let ctx_file = work.join(".git/ghf/context.json");
+    let mut ctx: Value = serde_json::from_str(&fs::read_to_string(&ctx_file).unwrap()).unwrap();
+    ctx["path"] = Value::String(root.join("elsewhere").display().to_string());
+    fs::write(&ctx_file, ctx.to_string()).unwrap();
+    m.hf(&work, &["status"]).ok();
+    assert_eq!(trace_state(&m, &work, &t1), "closed");
+
+    // A linked worktree with an open trace is removed.
+    let wt = root.join("wt2");
+    git(
+        &work,
+        &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()],
+    );
+    fs::copy(work.join(".ghf"), wt.join(".ghf")).unwrap();
+    fs::write(wt.join("g.txt"), "1").unwrap();
+    let t2 = checkpoint(&m, &wt)["trace_id"].as_str().unwrap().to_owned();
+    git(
+        &work,
+        &["worktree", "remove", "--force", wt.to_str().unwrap()],
+    );
+    assert_eq!(trace_state(&m, &work, &t2), "open");
+    let d = m.hf(&work, &["prune", "--dry-run"]).ok().clone();
+    assert_eq!(d["local"]["closed_orphans"][0], t2.as_str(), "{d}");
+    assert_eq!(trace_state(&m, &work, &t2), "open");
+    m.hf(&work, &["prune"]).ok();
+    assert_eq!(trace_state(&m, &work, &t2), "closed");
+    // This worktree's own trace is untouched.
+    fs::write(work.join("f.txt"), "2").unwrap();
+    let t3 = checkpoint(&m, &work)["trace_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    m.hf(&work, &["prune"]).ok();
+    assert_eq!(trace_state(&m, &work, &t3), "open");
+}
