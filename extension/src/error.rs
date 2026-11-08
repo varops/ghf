@@ -63,6 +63,12 @@ impl From<rusqlite::Error> for Failure {
     }
 }
 
+impl From<ghf_proto::StateError> for Failure {
+    fn from(e: ghf_proto::StateError) -> Self {
+        Failure::new(ErrorCode::TraceState, e.0)
+    }
+}
+
 impl From<serde_json::Error> for Failure {
     fn from(e: serde_json::Error) -> Self {
         Failure::new(ErrorCode::Internal, format!("JSON error: {e}"))

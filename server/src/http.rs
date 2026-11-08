@@ -21,6 +21,8 @@ pub struct AppState {
     pub store: Mutex<Store>,
     pub server_id: String,
     pub policy: Policy,
+    /// Pending reports older than this are ignored when pruning.
+    pub pending_max_age_ms: i64,
     /// Mark UI session cookies `Secure` (the server terminates TLS).
     pub secure_cookies: bool,
 }
@@ -255,6 +257,7 @@ async fn put_trace(
     if t.id != id || !ghf_proto::id::is_id(ghf_proto::id::TRACE, &id) {
         return Err(bad(ErrorCode::Usage, "trace id mismatch"));
     }
+    t.validate().map_err(|e| bad(ErrorCode::Usage, e.0))?;
     let store = s.store.lock().expect("store lock");
     Ok(Json(store.merge_trace(&repo, &t)?))
 }
@@ -426,7 +429,13 @@ async fn prune_handler(
     let s2 = s.clone();
     let report = tokio::task::spawn_blocking(move || {
         let store = s2.store.lock().expect("store lock");
-        prune::prune_repo(&store, &repo, &s2.policy, req.dry_run)
+        prune::prune_repo(
+            &store,
+            &repo,
+            &s2.policy,
+            s2.pending_max_age_ms,
+            req.dry_run,
+        )
     })
     .await
     .map_err(|e| bad(ErrorCode::Internal, e.to_string()))??;

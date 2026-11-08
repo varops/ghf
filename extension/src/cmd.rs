@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use ghf_proto::object::Mode;
 use ghf_proto::retention::{self, DAY_MS};
-use ghf_proto::{CheckpointRecord, Hold, Policy, TraceRecord, TraceState};
+use ghf_proto::{CheckpointRecord, Hold, Outcome, Policy, TraceRecord, TraceState};
 use serde_json::{Value, json};
 
 use crate::capture::{self, Request};
@@ -72,8 +72,11 @@ fn trace_json(ws: &Workspace, t: &TraceRow, policy: &Policy) -> Result<Value> {
     Ok(v)
 }
 
+/// The retention policy: the server's, as cached by the last sync with the
+/// configured server, else the `.ghf` policy.
 fn policy(ws: &Workspace) -> Result<Policy> {
-    if let Some(p) = ws.store.kv_get("server_policy")?
+    if remote::cached_policy_applies(ws)?
+        && let Some(p) = ws.store.kv_get("server_policy")?
         && let Ok(p) = serde_json::from_str(&p)
     {
         return Ok(p);
@@ -274,6 +277,21 @@ pub fn status(env: &Env) -> Result<Out> {
         _ => human.push("no open trace".into()),
     }
 
+    let interrupted = ws.interrupted().map(|i| {
+        let command = i.undo_command();
+        warnings.push(format!(
+            "an in-place {} of {} was interrupted and the working tree may be partly changed{}",
+            i.operation,
+            i.target,
+            command
+                .as_deref()
+                .map(|c| format!("; undo with `{c}`"))
+                .unwrap_or_default()
+        ));
+        let mut v = serde_json::to_value(&i).unwrap_or(Value::Null);
+        v["command"] = json!(command);
+        v
+    });
     let unsynced = ws.store.unsynced_count()?;
     let failures = ws.store.failures_since(now - DAY_MS)?;
     let last_sync_error: Option<Value> = ws
@@ -311,6 +329,13 @@ pub fn status(env: &Env) -> Result<Out> {
     if rejected > 0 {
         warnings.push(format!(
             "{rejected} checkpoint(s) were refused by the server and exist only on this machine"
+        ));
+    }
+    let refused_holds = ws.store.refused_holds_since(now - 7 * DAY_MS)?;
+    for h in &refused_holds {
+        warnings.push(format!(
+            "the server refused to {} hold {:?} on trace {}: {} ({})",
+            h.op, h.name, h.trace, h.message, h.code
         ));
     }
     if let Some(e) = &last_sync_error {
@@ -354,6 +379,8 @@ pub fn status(env: &Env) -> Result<Out> {
             "latest_checkpoint": latest,
             "unsynced": unsynced,
             "rejected": rejected,
+            "refused_holds": refused_holds,
+            "interrupted": interrupted,
             "last_sync_at": last_sync_at,
             "last_sync_error": last_sync_error,
             "capture_failures": failures.iter().map(|(at, code, msg, strict)| json!({
@@ -445,6 +472,7 @@ pub fn sync(env: &Env, background: bool) -> Result<Out> {
     let Some(remote) = Remote::connect(&ws, env.prompt())? else {
         fail!(Config, "no server configured in .ghf");
     };
+    let _lock = remote::sync_lock(&ws)?;
     let r = match remote::sync(&ws, &remote) {
         Ok(r) => r,
         Err(f) => {
@@ -469,6 +497,7 @@ fn resolve_checkpoint(ws: &Workspace, r: &str, prompt: bool) -> Result<Checkpoin
     match refs::checkpoint(ws, r) {
         Err(f) if f.code == ghf_proto::ErrorCode::NotFound && !r.starts_with('@') => {
             if let Some(remote) = Remote::connect(ws, prompt)? {
+                let _lock = remote::sync_lock(ws)?;
                 remote::pull(ws, &remote, &mut remote::SyncReport::default())?;
                 return refs::checkpoint(ws, r);
             }
@@ -482,6 +511,7 @@ fn resolve_trace(ws: &Workspace, r: Option<&str>, prompt: bool) -> Result<TraceR
     match refs::trace(ws, r) {
         Err(f) if f.code == ghf_proto::ErrorCode::NotFound && r.is_some() => {
             if let Some(remote) = Remote::connect(ws, prompt)? {
+                let _lock = remote::sync_lock(ws)?;
                 remote::pull(ws, &remote, &mut remote::SyncReport::default())?;
                 return refs::trace(ws, r);
             }
@@ -889,7 +919,7 @@ pub fn trace_restore(
     }
     // Scan once: the guard, the pre-restore checkpoint and the restore all
     // see the same state. The checkpoint is durable before the tree changes.
-    let (current, pre) = ws.store.tx(|| {
+    let (current, pre, before) = ws.store.tx(|| {
         let snap = scan::scan(&ws.repo, &ws.store, &capture::scan_options(&ws, true)?)?;
         let latest = match &open {
             Some(t) => ws.store.latest_checkpoint(&t.record.id)?,
@@ -898,7 +928,7 @@ pub fn trace_restore(
         // With --index the index is rewritten too, so it must be captured.
         let index_clean = !index || latest.as_ref().map(|l| &l.index) == Some(&capture::index_state(&ws)?);
         if index_clean && latest.as_ref().is_some_and(|l| l.root == snap.root) {
-            return Ok((snap, None));
+            return Ok((snap, None, latest.map(|l| l.id)));
         }
         if !force {
             return Err(err!(
@@ -915,10 +945,14 @@ pub fn trace_restore(
             ..Default::default()
         };
         let o = capture::record(&ws, open.clone(), snap.clone(), &req, None)?;
-        Ok((snap, Some(o.checkpoint)))
+        let id = o.checkpoint.id.clone();
+        Ok((snap, Some(o.checkpoint), Some(id)))
     })?;
     let target = scan::flatten(&ws.store, &ck.root)?;
-    let stats = materialize::materialize(&ws.repo.root, &ws.store, &target, &current.files)?;
+    let stats =
+        materialize::materialize_with(&ws.repo.root, &ws.store, &target, &current.files, || {
+            ws.begin_operation("restore", &ck.id, before.as_deref())
+        })?;
     let mut warnings = stats.warnings.clone();
     let restaged = if index {
         restage(&ws.repo, &ws.store, &ck)?
@@ -949,6 +983,7 @@ pub fn trace_restore(
             ck.id
         );
     }
+    ws.end_operation()?;
     remote::spawn_background(&ws);
     Ok(Out::new(
         json!({
@@ -1120,7 +1155,7 @@ pub fn trace_apply(env: &Env, range: String, write_conflicts: bool) -> Result<Ou
     let deltas = scan::diff_trees(&ws.store, Some(&a.root), Some(&b.root))?;
     // Scan, merge and the pre-apply checkpoint commit together, before the
     // tree changes. A refusal rolls everything back.
-    let (current, target, conflicts, pre) = ws.store.tx(|| {
+    let (current, target, conflicts, pre, before) = ws.store.tx(|| {
         let current = scan::scan(&ws.repo, &ws.store, &capture::scan_options(&ws, true)?)?;
         let (target, conflicts) = plan_apply(&ws, &deltas, &current.files, write_conflicts)?;
         if !conflicts.is_empty() && (!write_conflicts || conflicts.iter().any(|c| c.hard)) {
@@ -1138,6 +1173,7 @@ pub fn trace_apply(env: &Env, range: String, write_conflicts: bool) -> Result<Ou
             None => None,
         };
         let mut pre = None;
+        let mut before = latest.as_ref().map(|l| l.id.clone());
         if latest.as_ref().is_none_or(|l| l.root != current.root) {
             let req = Request {
                 message: Some(format!("before apply {}..{}", a.id, b.id)),
@@ -1149,10 +1185,14 @@ pub fn trace_apply(env: &Env, range: String, write_conflicts: bool) -> Result<Ou
                     .checkpoint
                     .id,
             );
+            before = pre.clone();
         }
-        Ok((current, target, conflicts, pre))
+        Ok((current, target, conflicts, pre, before))
     })?;
-    let stats = materialize::materialize(&ws.repo.root, &ws.store, &target, &current.files)?;
+    let stats =
+        materialize::materialize_with(&ws.repo.root, &ws.store, &target, &current.files, || {
+            ws.begin_operation("apply", &format!("{}..{}", a.id, b.id), before.as_deref())
+        })?;
     let req = Request {
         message: Some(format!("applied {}..{}", a.id, b.id)),
         annotations: BTreeMap::from([
@@ -1175,6 +1215,7 @@ pub fn trace_apply(env: &Env, range: String, write_conflicts: bool) -> Result<Ou
             "worktree does not match the planned apply result (something wrote to it concurrently?); undo with `git hf trace restore {undo} --in-place --force`"
         );
     }
+    ws.end_operation()?;
     remote::spawn_background(&ws);
     let data = json!({
         "applied": true,
@@ -1206,32 +1247,35 @@ pub fn trace_apply(env: &Env, range: String, write_conflicts: bool) -> Result<Ou
 // ---------------------------------------------------------------------------
 // lifecycle
 
-fn save_trace(ws: &Workspace, t: &TraceRecord) -> Result<()> {
-    ws.store.update_trace(t, true)?;
-    remote::spawn_background(ws);
-    Ok(())
+/// Re-read a trace inside a write transaction, so a change is made to its
+/// current record, not to a copy read before a concurrent capture or pull.
+fn reread(ws: &Workspace, id: &str) -> Result<TraceRecord> {
+    Ok(ws
+        .store
+        .trace(id)?
+        .ok_or_else(|| err!(NotFound, "trace {id} disappeared"))?
+        .record)
 }
 
 pub fn trace_close(env: &Env, trace: Option<String>) -> Result<Out> {
     let ws = env.ws()?;
     let row = resolve_trace(&ws, trace.as_deref(), env.prompt())?;
-    let mut t = row.record;
-    let was = t.state;
-    if was == TraceState::Open {
-        t.state = TraceState::Closed;
-        t.closed_at = Some(ghf_proto::id::now_ms());
-        save_trace(&ws, &t)?;
-        ws.store.set_writer(&t.id, None, 0)?;
-    }
-    let human = if was == TraceState::Open {
+    // The new state and the cleared writer commit together.
+    let (t, changed) = ws.store.tx(|| {
+        let mut t = reread(&ws, &row.record.id)?;
+        let changed = t.close(ghf_proto::id::now_ms())?;
+        if changed {
+            ws.store.update_trace(&t, true)?;
+        }
+        Ok((t, changed))
+    })?;
+    let human = if changed {
+        remote::spawn_background(&ws);
         format!("closed trace {}", t.id)
     } else {
-        format!("trace {} is already {}", t.id, was.as_str())
+        format!("trace {} is already {}", t.id, t.state.as_str())
     };
-    Ok(Out::new(
-        json!({"trace": t, "changed": was == TraceState::Open}),
-        human,
-    ))
+    Ok(Out::new(json!({"trace": t, "changed": changed}), human))
 }
 
 fn main_ref(ws: &Workspace) -> Result<String> {
@@ -1263,7 +1307,6 @@ pub fn trace_finalize(
 ) -> Result<Out> {
     let ws = env.ws()?;
     let row = resolve_trace(&ws, trace.as_deref(), env.prompt())?;
-    let mut t = row.record;
     let sha = match &commit {
         Some(c) => {
             let sha = ws.repo.resolve_commit(c).ok_or_else(|| {
@@ -1283,28 +1326,27 @@ pub fn trace_finalize(
         }
         None => None,
     };
-    match t.state {
-        TraceState::Finalized | TraceState::Pruned => {
-            if t.final_commit == sha && t.abandoned == abandoned {
-                return Ok(Out::new(
-                    json!({"trace": t, "changed": false}),
-                    format!("trace {} is already finalized", t.id),
-                ));
-            }
-            fail!(TraceState, "trace {} is already {}", t.id, t.state.as_str());
+    // The new state and the cleared writer commit together.
+    let outcome = match (&sha, abandoned) {
+        (Some(c), false) => Outcome::Commit(c.clone()),
+        (None, true) => Outcome::Abandoned,
+        _ => fail!(Usage, "pass exactly one of --commit and --abandoned"),
+    };
+    let (t, changed) = ws.store.tx(|| {
+        let mut t = reread(&ws, &row.record.id)?;
+        let changed = t.finalize(ghf_proto::id::now_ms(), outcome.clone())?;
+        if changed {
+            ws.store.update_trace(&t, true)?;
         }
-        TraceState::Open | TraceState::Closed => {}
+        Ok((t, changed))
+    })?;
+    if !changed {
+        return Ok(Out::new(
+            json!({"trace": t, "changed": false}),
+            format!("trace {} is already finalized", t.id),
+        ));
     }
-    let now = ghf_proto::id::now_ms();
-    if t.state == TraceState::Open {
-        t.closed_at = Some(now);
-        ws.store.set_writer(&t.id, None, 0)?;
-    }
-    t.state = TraceState::Finalized;
-    t.finalized_at = Some(now);
-    t.final_commit = sha.clone();
-    t.abandoned = abandoned;
-    save_trace(&ws, &t)?;
+    remote::spawn_background(&ws);
     let human = match &sha {
         Some(s) => format!("finalized trace {} against {s}", t.id),
         None => format!("finalized trace {} as abandoned", t.id),
@@ -1322,6 +1364,13 @@ pub fn trace_hold(
     let ws = env.ws()?;
     let row = resolve_trace(&ws, Some(&trace), env.prompt())?;
     let mut t = row.record;
+    if t.state == TraceState::Pruned {
+        fail!(
+            TraceState,
+            "trace {} is pruned; holds no longer apply",
+            t.id
+        );
+    }
     if name.is_empty()
         || name.len() > 64
         || !name
@@ -1366,7 +1415,14 @@ pub fn trace_hold(
 pub fn prune(env: &Env, dry_run: bool) -> Result<Out> {
     let ws = env.ws()?;
     let mut server_report = None;
-    if let Some(remote) = Remote::connect(&ws, env.prompt())? {
+    let remote = Remote::connect(&ws, env.prompt())?;
+    // Held through the local prune too, so a background sync never pushes
+    // what is being dropped.
+    let _lock = match &remote {
+        Some(_) => Some(remote::sync_lock(&ws)?),
+        None => None,
+    };
+    if let Some(remote) = remote {
         // Push first so the server knows about everything this client holds.
         remote::sync(&ws, &remote)?;
         server_report = Some(remote.prune(dry_run)?);
@@ -1397,16 +1453,20 @@ pub fn prune(env: &Env, dry_run: bool) -> Result<Out> {
 
 /// Drop local payloads of pruned traces (or, with no server, of eligible
 /// fully-local traces), keeping fork bases, then collect unreferenced objects.
+/// With a server, a trace holding pending or refused checkpoints is kept.
 fn prune_local(ws: &Workspace, dry_run: bool, has_server: bool) -> Result<Value> {
     let now = ghf_proto::id::now_ms();
+    let closed_orphans = close_orphans(ws, dry_run, now)?;
     let policy = policy(ws)?;
     let traces = ws.store.traces()?;
     let mut doomed = Vec::new();
     let mut keep: Vec<String> = Vec::new();
     for t in &traces {
         let prunable = if has_server {
-            // The server decides; never drop anything not yet uploaded.
-            t.record.state == TraceState::Pruned && ws.store.unsynced_in_trace(&t.record.id)? == 0
+            // The server decides. Never drop a checkpoint that exists only
+            // here: pending ones are not uploaded yet, refused ones never
+            // will be.
+            t.record.state == TraceState::Pruned && ws.store.local_only_in_trace(&t.record.id)? == 0
         } else {
             t.record.state == TraceState::Pruned
                 || retention::eligibility(&t.record, now, &policy).eligible
@@ -1434,17 +1494,43 @@ fn prune_local(ws: &Workspace, dry_run: bool, has_server: bool) -> Result<Value>
             continue;
         }
         ws.store.delete_trace_rows(&t.id, &keep)?;
-        if t.state != TraceState::Pruned {
-            let mut r = t.clone();
-            r.state = TraceState::Pruned;
-            r.pruned_at = Some(now);
+        let mut r = t.clone();
+        if r.prune(now)? {
             ws.store.update_trace(&r, false)?;
         }
     }
     let (objects_deleted, bytes) = if dry_run { (0, 0) } else { gc(ws)? };
     Ok(
-        json!({"pruned": pruned, "retained_checkpoints": keep, "objects_deleted": objects_deleted, "bytes_freed": bytes}),
+        json!({"pruned": pruned, "retained_checkpoints": keep, "objects_deleted": objects_deleted, "bytes_freed": bytes, "closed_orphans": closed_orphans}),
     )
+}
+
+/// Close the open traces of worktree contexts created on this machine that
+/// are gone: their worktree was removed or moved, so their context file no
+/// longer names them. Contexts created before ghf recorded them are not
+/// known and are left alone.
+fn close_orphans(ws: &Workspace, dry_run: bool, now: i64) -> Result<Vec<String>> {
+    let mut closed = Vec::new();
+    for (id, git_dir) in ws.store.contexts()? {
+        if id == ws.ctx.id || workspace::context_id_at(&git_dir).as_deref() == Some(&id) {
+            continue;
+        }
+        if dry_run {
+            closed.extend(
+                ws.store
+                    .traces()?
+                    .into_iter()
+                    .filter(|t| t.record.context_id == id && t.record.state == TraceState::Open)
+                    .map(|t| t.record.id),
+            );
+            continue;
+        }
+        ws.store.tx(|| {
+            closed.extend(ws.store.close_context_traces(&id, now)?);
+            ws.store.forget_context(&id)
+        })?;
+    }
+    Ok(closed)
 }
 
 /// Delete objects no remaining checkpoint references. Objects younger than

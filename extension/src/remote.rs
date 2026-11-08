@@ -9,12 +9,13 @@ use ghf_proto::api::{
     ServerInfo,
 };
 use ghf_proto::object::Mode;
-use ghf_proto::{CheckpointRecord, ErrorCode, ObjectId, Policy, TraceRecord};
+use ghf_proto::{CheckpointRecord, ErrorCode, ObjectId, Policy, TraceRecord, TraceState};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::config;
 use crate::error::{Failure, Result};
+use crate::store::SyncState;
 use crate::workspace::{FileLock, Workspace};
 use crate::{err, fail};
 
@@ -309,6 +310,82 @@ pub struct SyncReport {
     pub pending: i64,
     /// Checkpoints the server refused permanently; kept locally, not retried.
     pub rejected: Vec<String>,
+    /// Hold operations the server refused permanently; dropped, not retried.
+    pub refused_holds: Vec<crate::store::RefusedHold>,
+    /// Traces finalized here that another machine had finalized first with
+    /// another outcome. The server's result was kept and adopted here.
+    pub trace_conflicts: Vec<TraceConflict>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TraceConflict {
+    pub trace: String,
+    pub ours: FinalState,
+    pub kept: FinalState,
+}
+
+/// How a trace was finalized.
+#[derive(Debug, Serialize)]
+pub struct FinalState {
+    pub final_commit: Option<String>,
+    pub abandoned: bool,
+}
+
+impl FinalState {
+    fn of(t: &TraceRecord) -> Self {
+        Self {
+            final_commit: t.final_commit.clone(),
+            abandoned: t.abandoned,
+        }
+    }
+}
+
+/// Errors that will not go away by retrying the same request.
+fn permanent(code: ErrorCode) -> bool {
+    matches!(
+        code,
+        ErrorCode::TraceState | ErrorCode::NotFound | ErrorCode::Usage
+    )
+}
+
+/// What sync progress belongs to: the server URL and the repository on it.
+/// The pull cursor, which checkpoints count as synced, the cache of objects
+/// the server holds and its cached policy are only valid for this target.
+fn sync_identity(url: &str, repo: &str) -> String {
+    format!("{url} {repo}")
+}
+
+/// Whether the cached server policy belongs to the configured server.
+pub fn cached_policy_applies(ws: &Workspace) -> Result<bool> {
+    let Some(server) = &ws.cfg.server else {
+        return Ok(false);
+    };
+    let Ok(url) = config::normalize_url(&server.url) else {
+        return Ok(false);
+    };
+    Ok(match ws.store.kv_get("sync_identity")? {
+        Some(id) => id == sync_identity(&url, &server.repository),
+        // Stores from before the identity was recorded.
+        None => true,
+    })
+}
+
+/// Tie the store's sync progress to `remote`. When the target changed since
+/// the last sync, start over: pull from the beginning, push every trace and
+/// every checkpoint whose content is on this machine again, forget which
+/// objects the old server held and its policy.
+fn bind_identity(ws: &Workspace, remote: &Remote) -> Result<()> {
+    let id = sync_identity(&remote.url, &remote.repo);
+    match ws.store.kv_get("sync_identity")? {
+        Some(old) if old == id => Ok(()),
+        // A store from before the identity was recorded: its progress
+        // belongs to the server it was syncing with, the configured one.
+        None => ws.store.kv_set("sync_identity", &id),
+        Some(_) => ws.store.tx(|| {
+            ws.store.reset_sync_progress()?;
+            ws.store.kv_set("sync_identity", &id)
+        }),
+    }
 }
 
 fn client_id(ws: &Workspace) -> Result<String> {
@@ -415,13 +492,26 @@ fn upload_closure(
 
 /// Push everything pending, then pull remote metadata.
 pub fn sync(ws: &Workspace, remote: &Remote) -> Result<SyncReport> {
+    bind_identity(ws, remote)?;
     let mut report = SyncReport::default();
     let client = client_id(ws)?;
     remote.report_pending(&client, pending_traces(ws)?)?;
 
     for t in ws.store.dirty_traces()? {
-        remote.put_trace(&t)?;
-        ws.store.mark_trace_clean(&t)?;
+        let merged = remote.put_trace(&t)?;
+        // Another machine finalized it first with another outcome; its
+        // result stands.
+        if t.state == TraceState::Finalized
+            && let Some(kept) = merged.outcome()
+            && t.outcome().is_some_and(|ours| ours != kept)
+        {
+            report.trace_conflicts.push(TraceConflict {
+                trace: t.id.clone(),
+                ours: FinalState::of(&t),
+                kept: FinalState::of(&merged),
+            });
+        }
+        ws.store.adopt_trace(&t, &merged)?;
         report.pushed_traces += 1;
     }
 
@@ -445,14 +535,9 @@ pub fn sync(ws: &Workspace, remote: &Remote) -> Result<SyncReport> {
             Ok(()) => {}
             // A permanent refusal (for example, its trace was pruned on the
             // server) must not block every later checkpoint.
-            Err(f)
-                if matches!(
-                    f.code,
-                    ErrorCode::TraceState | ErrorCode::NotFound | ErrorCode::Usage
-                ) =>
-            {
+            Err(f) if permanent(f.code) => {
                 ws.store.tx(|| {
-                    ws.store.mark_rejected(&ck.id)?;
+                    ws.store.set_sync_state(&ck.id, SyncState::Refused)?;
                     ws.store.record_failure(
                         Some(&ck.context_id),
                         f.code.as_str(),
@@ -468,19 +553,31 @@ pub fn sync(ws: &Workspace, remote: &Remote) -> Result<SyncReport> {
         // The server verified the closure: remember it to skip next time.
         ws.store.tx(|| {
             ws.store.mark_remote(&sent)?;
-            ws.store.mark_synced(&ck.id)
+            ws.store.set_sync_state(&ck.id, SyncState::Synced)
         })?;
         report.pushed_checkpoints += 1;
     }
 
-    for (op, trace, name, place, expires) in ws.store.hold_ops()? {
-        if place {
-            remote.put_hold(&trace, &name, expires)?;
+    for op in ws.store.hold_ops()? {
+        let (id, trace, name, place, expires) = &op;
+        let result = if *place {
+            remote.put_hold(trace, name, *expires)
         } else {
-            remote.delete_hold(&trace, &name)?;
+            remote.delete_hold(trace, name)
+        };
+        match result {
+            Ok(()) => {
+                ws.store.remove_hold_op(*id)?;
+                report.hold_ops += 1;
+            }
+            // A pruned or unknown trace will never take this hold; drop it
+            // so it does not block every later sync.
+            Err(f) if permanent(f.code) => {
+                let refused = ws.store.refuse_hold_op(&op, f.code.as_str(), &f.message)?;
+                report.refused_holds.push(refused);
+            }
+            Err(f) => return Err(f),
         }
-        ws.store.remove_hold_op(op)?;
-        report.hold_ops += 1;
     }
 
     remote.report_pending(&client, pending_traces(ws)?)?;
@@ -498,6 +595,7 @@ pub fn sync(ws: &Workspace, remote: &Remote) -> Result<SyncReport> {
 
 /// Pull trace and checkpoint metadata. Content is fetched lazily.
 pub fn pull(ws: &Workspace, remote: &Remote, report: &mut SyncReport) -> Result<()> {
+    bind_identity(ws, remote)?;
     let mut since: i64 = ws
         .store
         .kv_get("pull_cursor")?
@@ -526,7 +624,7 @@ pub fn pull(ws: &Workspace, remote: &Remote, report: &mut SyncReport) -> Result<
                 report.pulled_traces += 1;
             }
             for c in &ch.checkpoints {
-                ws.store.insert_checkpoint(c, true)?;
+                ws.store.insert_checkpoint(c, SyncState::Synced)?;
                 report.pulled_checkpoints += 1;
             }
             ws.store.kv_set("pull_cursor", &ch.next.to_string())?;
@@ -658,10 +756,21 @@ pub fn spawn_background(ws: &Workspace) {
     let _ = cmd.spawn();
 }
 
+fn sync_lock_path(ws: &Workspace) -> std::path::PathBuf {
+    ws.store.dir.join("sync.lock")
+}
+
+/// Wait for, then hold, the lock every sync run takes (foreground,
+/// background, prune and the pull behind an unknown id), so two runs never
+/// interleave.
+pub fn sync_lock(ws: &Workspace) -> Result<FileLock> {
+    FileLock::acquire(&sync_lock_path(ws))
+}
+
 /// Body of `git hf sync --background`: one runner at a time, repeat while
 /// new checkpoints keep arriving.
 pub fn background(ws: &Workspace) -> Result<Option<SyncReport>> {
-    let Some(_lock) = FileLock::try_acquire(&ws.store.dir.join("sync.lock"))? else {
+    let Some(_lock) = FileLock::try_acquire(&sync_lock_path(ws))? else {
         return Ok(None);
     };
     let remote = match Remote::connect(ws, false)? {

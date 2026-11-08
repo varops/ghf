@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Refused checkpoints survive `prune`.** Local prune dropped a trace the server had pruned even when it held checkpoints the server refused, so they were lost although they were promised to stay restorable. A trace with pending or refused checkpoints is now kept.
+- **A refused hold no longer blocks sync.** Pinning or holding a trace that was pruned on the server, or that the server does not know, made every later `sync` fail at that hold. Such a hold is now dropped and reported in the new `refused_holds` field of `sync` and `status`. Holds on a trace this machine already knows is pruned are refused with `E_TRACE_STATE`.
+- **No checkpoints into a closed trace.** A capture that read the open trace just before `trace close`, `trace finalize` or a pull closed it could still append its checkpoint to that trace and claim it as writer. A capture now re-checks the trace inside its transaction and opens a new trace if it is no longer open; in-place restore and apply do the same. `close` and `finalize` change the record and release the writer in one transaction, and a pulled trace that is no longer open loses its writer.
+- **Changing server starts sync over.** After `init --server NEW --force`, or a changed repository, sync kept the old pull cursor (skipping the new server's history), never pushed checkpoints already synced to the old server, and kept using the old server's retention policy. Sync progress is now tied to the server URL and repository: when they change, the next sync pulls from the start and pushes every trace and every checkpoint whose content is on this machine. With no server configured, the cached server policy is ignored.
+- **A losing finalize is reported.** When two machines finalized the same trace differently, the second one's sync silently took the first one's result later. Sync now adopts the server's merged record right away and lists the trace in the new `trace_conflicts` field.
+- **No orphaned open traces.** When a worktree's context is replaced (the directory moved, or came from another machine), the old context's open trace is now closed. `prune` also closes the open trace of a worktree that was removed or moved away, and lists it in `local.closed_orphans`. This works for contexts created by this version or later.
+- **Idempotency keys are reserved before the command runs.** Two runs with the same key at the same time both acted. Now the second gets the new error `E_IDEMPOTENCY_IN_PROGRESS` (exit 4). A reservation older than `GHF_IDEMPOTENCY_STALE` (default `10m`) is taken to be from a crashed run, and the key runs again. A failed run is recorded too: replaying its key returns the same error, with `data.replayed`, instead of acting again. The fingerprint no longer drops arguments that happen to equal the key, so `trace close K --idempotency-key K` and `trace close --idempotency-key K` no longer count as the same command. Existing stores gain the new column on first open.
+- **Interrupted in-place restore and apply are reported.** An in-place restore or apply that stopped partway left a half-changed tree with no trace of what happened. ghf now writes `<git-dir>/ghf/operation.json` just before the tree changes and removes it once the result is recorded. While it exists, `status` reports the operation and the undo command in the new `interrupted` field, and captures are annotated `interrupted=restore` (or `apply`). Hooks are never blocked.
+- **One sync at a time.** Foreground `sync`, `prune` and the pull behind an unknown reference could run alongside a background sync and interleave with it. They now take the same lock and wait for the run in progress.
+
+### Server
+
+- **Trace records are checked.** `PUT traces/{id}` refuses a record whose fields do not fit its state with `E_USAGE`. Every state change on client and server goes through the record's own `close`, `finalize` and `prune` transitions.
+- **Clients cannot introduce a pruned trace.** A pushed `pruned` record for a trace the server did not know was stored as `closed` while keeping `pruned_at` and any finalize fields. It is now stored as `finalized` if it was finalized, else `closed`, without `pruned_at`.
+- **Stale pending reports expire.** A client that stopped syncing kept its report of unsynced checkpoints forever and blocked pruning of those traces. Reports older than `--pending-max-age` (default `30d`, on `serve` and `prune`) are now ignored, and each ignored report is logged.
+
 ## 0.1.0-rc.3 — 2026-11-04
 
 ### Added

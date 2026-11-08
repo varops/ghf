@@ -463,15 +463,19 @@ mod follow {
     #[test]
     fn sees_a_checkpoint_after_the_newest_was_deleted() {
         let (dir, s) = store("reuse");
-        s.insert_checkpoint(&ck("ck_a", 1), false).unwrap();
-        s.insert_checkpoint(&ck("ck_b", 2), false).unwrap();
+        s.insert_checkpoint(&ck("ck_a", 1), crate::store::SyncState::Pending)
+            .unwrap();
+        s.insert_checkpoint(&ck("ck_b", 2), crate::store::SyncState::Pending)
+            .unwrap();
         let last = s.checkpoints_after(0).unwrap().last().unwrap().0;
         s.db.execute("DELETE FROM checkpoints WHERE id = 'ck_b'", [])
             .unwrap();
-        s.insert_checkpoint(&ck("ck_c", 3), false).unwrap();
+        s.insert_checkpoint(&ck("ck_c", 3), crate::store::SyncState::Pending)
+            .unwrap();
         assert_eq!(ids(s.checkpoints_after(last).unwrap()), ["ck_c"]);
         // A repeated insert (sync pulling a known checkpoint) is not news.
-        s.insert_checkpoint(&ck("ck_c", 3), false).unwrap();
+        s.insert_checkpoint(&ck("ck_c", 3), crate::store::SyncState::Pending)
+            .unwrap();
         assert_eq!(ids(s.checkpoints_after(0).unwrap()), ["ck_a", "ck_c"]);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -487,12 +491,15 @@ mod follow {
              DELETE FROM checkpoint_arrivals; DELETE FROM kv WHERE key = 'arrivals_backfilled';",
         )
         .unwrap();
-        s.insert_checkpoint(&ck("ck_old1", 1), false).unwrap();
-        s.insert_checkpoint(&ck("ck_old2", 2), false).unwrap();
+        s.insert_checkpoint(&ck("ck_old1", 1), crate::store::SyncState::Pending)
+            .unwrap();
+        s.insert_checkpoint(&ck("ck_old2", 2), crate::store::SyncState::Pending)
+            .unwrap();
         drop(s);
         let s = Store::open(&dir).unwrap();
         assert_eq!(ids(s.checkpoints_after(0).unwrap()), ["ck_old1", "ck_old2"]);
-        s.insert_checkpoint(&ck("ck_new", 3), false).unwrap();
+        s.insert_checkpoint(&ck("ck_new", 3), crate::store::SyncState::Pending)
+            .unwrap();
         assert_eq!(
             ids(s.checkpoints_after(0).unwrap()),
             ["ck_old1", "ck_old2", "ck_new"]

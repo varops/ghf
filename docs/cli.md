@@ -15,7 +15,11 @@ With `--json`, every command prints exactly one JSON object on stdout:
 - **`command`** is the stable command name: `"checkpoint"`, `"trace restore"`, and so on.
 - **`data`** is present on success. Errors may also carry it, with structured detail such as conflicts, the lock holder or pending counts.
 - **No prompts.** With `--json` or a non-TTY, ghf never prompts. Missing input is an error (`E_USAGE`).
-- **`--idempotency-key KEY`** works on any mutating command. Repeating it with the same arguments returns `{"replayed": true, "result": <first data>}` without acting again. Repeating it with different arguments returns `E_IDEMPOTENCY_CONFLICT`.
+- **`--idempotency-key KEY`** works on any mutating command. The key is reserved before the command runs.
+  - **Same arguments, after success:** returns `{"replayed": true, "result": <first data>}` without acting again.
+  - **Same arguments, after failure:** returns the same error, with `data` `{"replayed": true, "result": <first error data>}`, without acting again.
+  - **Different arguments:** `E_IDEMPOTENCY_CONFLICT`. Every argument counts, even one equal to the key.
+  - **While the first run is still going:** `E_IDEMPOTENCY_IN_PROGRESS`. A reservation older than `GHF_IDEMPOTENCY_STALE` (default `10m`) is taken to be from a run that crashed, and the key runs again.
 
 The `hook` command is the one exception: it answers in the harness's own format.
 
@@ -51,6 +55,7 @@ The `hook` command is the one exception: it answers in the harness's own format.
 | `E_COMMIT_NOT_REACHABLE` | 3 | Commit is not reachable from the main ref |
 | `E_APPLY_CONFLICT` | 4 | Apply conflicts; `data.conflicts[]` of `{path, reason}`, `data.applied` |
 | `E_IDEMPOTENCY_CONFLICT` | 4 | Key reused with different arguments |
+| `E_IDEMPOTENCY_IN_PROGRESS` | 4 | A run with this key has not finished; `data.started_at`, `data.stale_at` |
 | `E_NOT_SYNCED` | 5 | Checkpoints not yet on the server |
 | `E_UNTRUSTED_SERVER` | 5 | Server not trusted on this machine; run `ghf trust` |
 | `E_AUTH` | 5 | Missing or rejected credentials |
@@ -104,6 +109,8 @@ The `hook` command is the one exception: it answers in the harness's own format.
  "holds": [{"name": "pin", "expires_at": null, "created_at": 0}]}
 ```
 
+The fields fit the state: `closed_at` from `closed` on, `finalized_at` and exactly one of `final_commit` and `abandoned` once `finalized`, and `pruned_at` once `pruned`.
+
 `trace list` and `status` add a few fields to each trace:
 - `checkpoints` and `unsynced`, both counts.
 - `writer`.
@@ -128,15 +135,17 @@ Data:
 
 ```text
 {repository_root, context, capture_mode, trace, latest_checkpoint, unsynced, rejected,
- last_sync_at, last_sync_error, capture_failures[], server, warnings[]}
+ refused_holds[], interrupted, last_sync_at, last_sync_error, capture_failures[], server, warnings[]}
 ```
+
+`interrupted` is null, or the in-place restore or apply that stopped partway: `{operation, target, undo, started_at, command}`. `operation` is `restore` or `apply`, `target` the checkpoint or `A..B` range, `undo` the checkpoint holding the tree from before, and `command` the command that puts it back.
 
 `warnings` includes:
 - An untrusted server or missing credentials.
 - A failed sync.
 - Recent capture failures.
 - Traces close to the unfinalized cap.
-- A context that was replaced because the directory came from another path or machine.
+- A context that was replaced because the directory came from another path or machine. The old context's open trace is closed then, since nothing can write to it again.
 
 ### `checkpoint [-m MSG] [--annotate K=V]... [--trace-name NAME] [--force] [--takeover]`
 
@@ -153,14 +162,18 @@ Data: `{created, trace_created, checkpoint, trace}`.
 Pushes traces, checkpoints and holds, then pulls metadata from other machines.
 
 - **Content is lazy:** it is fetched on restore, diff or apply.
+- **One run at a time:** `sync`, background sync, `prune` and the pull behind an unknown reference share one lock per repository. A run waits for the one in progress (background sync skips instead).
 - **Refused checkpoints:** a checkpoint the server refuses permanently (for example, its trace was pruned there) is listed in `rejected`. It stays restorable on this machine and no longer blocks later uploads.
+- **Refused holds:** a hold change the server refuses permanently (`E_TRACE_STATE`, `E_NOT_FOUND` or `E_USAGE`, for example because its trace was pruned there) is dropped and listed in `refused_holds` as `{trace, name, op, code, message, at}`, where `op` is `place` or `release`. `status` reports it for 7 days. Other errors stop the sync and the hold is retried next time.
 - **On failure:** `data.pending` holds the count still to push.
+- **Finalize conflicts:** when another machine finalized a trace first with a different outcome, its result stands. This machine adopts it and lists the trace in `trace_conflicts` as `{trace, ours, kept}`, each `{final_commit, abandoned}`.
+- **Changing server or repository:** sync progress belongs to one server URL and repository. When `.ghf` points somewhere else (`init --server NEW --force`), the next sync starts over: it pulls the new target's history from the beginning and pushes every trace and every checkpoint again. A checkpoint pulled from the old server whose content was never fetched to this machine cannot be pushed and is left out. The old server's cached retention policy is dropped; with no server configured, only the `.ghf` `[retention]` policy applies.
 
 Data:
 
 ```text
 {pushed_traces, pushed_checkpoints, pushed_objects, pushed_bytes, hold_ops,
- pulled_traces, pulled_checkpoints, pending, rejected[]}
+ pulled_traces, pulled_checkpoints, pending, rejected[], refused_holds[], trace_conflicts[]}
 ```
 
 ### `trust [URL]` · `login [--server URL]`
@@ -209,6 +222,7 @@ Runs only if the working tree matches the latest checkpoint of this worktree's o
 - **Untouched:** files ghf did not capture are never touched. That covers ignored files, skipped files and anything else not in the scan. If the checkpoint needs one of those paths, the restore is refused with `E_WORKTREE_DIRTY` and `data.paths`, before anything changes.
 - **`--index`** also restages the checkpoint's staged changes. The index then has to match the latest checkpoint too, or the restore is refused.
 - **History:** the result is recorded as a new checkpoint.
+- **Interrupted:** just before the first file changes, ghf writes `<git-dir>/ghf/operation.json` naming the operation, the target and the checkpoint to undo to. It is removed once the result is recorded. If the restore stops in between (a crash, a kill, an error), `status` reports it in `interrupted` with the undo command, and captures still run but are annotated `interrupted=restore` until a restore or apply completes.
 
 Data: `{restored_from, checkpoint, pre_restore_checkpoint, files_written, files_deleted, restaged, warnings[]}`.
 
@@ -223,6 +237,8 @@ Three-way merges the changes between two checkpoints onto the working tree. Text
 **On conflict:** it stops with `E_APPLY_CONFLICT` and leaves the tree unchanged. With `--write-conflicts`, it writes content conflicts with conflict markers instead. File/directory collisions and uncaptured files in the way always refuse, even with `--write-conflicts`.
 
 **History:** pending work is checkpointed before the apply, and the result is checkpointed after.
+
+**Interrupted:** like an in-place restore, an apply that stops partway is reported by `status` in `interrupted`, and captures are annotated `interrupted=apply` until a restore or apply completes.
 
 Data:
 
@@ -244,16 +260,18 @@ Data: `{trace, changed}`.
 
 ### `trace pin|unpin TRACE` · `trace hold TRACE --name N [--expires 7d]` · `trace release TRACE --name N`
 
-Holds stop pruning. `pin` is the hold named `pin`. Data: `{trace}`.
+Holds stop pruning. `pin` is the hold named `pin`. A pruned trace takes no holds: these commands refuse it with `E_TRACE_STATE`. Data: `{trace}`.
 
 ### `prune [--dry-run]`
 
 Asks the server to prune this repository, then drops local copies of pruned traces and collects unreferenced local objects.
 
 - **Without a server,** it applies the `.ghf` `[retention]` policy locally.
-- **Unsynced checkpoints** are never dropped.
+- **Checkpoints that exist only on this machine** are never dropped: those not yet synced, and those the server refused. A trace holding any of them keeps all its checkpoints, even after the server pruned it.
 
-Data: `{dry_run, server, local}`.
+- **Gone worktrees:** an open trace whose worktree was removed or moved away is closed first, and listed in `local.closed_orphans`. This covers worktree contexts created on this machine by this version of ghf or later; older ones are not recorded and stay open until closed by hand.
+
+Data: `{dry_run, server, local}`. `local` is `{pruned[], retained_checkpoints[], objects_deleted, bytes_freed, closed_orphans[]}`.
 
 ### `hooks install|uninstall|status HARNESS [--scope project|local|user]`
 
@@ -338,6 +356,7 @@ unfinalized_cap = "90d"
 | `GHF_CONFIG_DIR` | User config directory (default `$XDG_CONFIG_HOME/ghf` or `~/.config/ghf`) |
 | `GHF_ALLOW_INSECURE` | `1` allows plain `http://` to non-local hosts |
 | `GHF_GC_GRACE` | Minimum object age before local GC deletes it (default `1h`) |
+| `GHF_IDEMPOTENCY_STALE` | Age after which an unfinished idempotency key counts as crashed and may run again (default `10m`) |
 | `GHF_TIMING` | Print capture phase timings to stderr |
 | `GHF_NO_LISTING_CACHE` | Ask git for the file list on every capture instead of reusing it |
 
@@ -348,5 +367,7 @@ Everything ghf keeps on a machine lives outside Git history:
 - `<git-common-dir>/ghf/ghf.db` holds the checkpoints, traces, content, stat cache and sync state. It is shared by all worktrees of the repository.
 - `<git-dir>/ghf/context.json` holds this worktree's context.
 - `<git-dir>/ghf/capture.lock` serializes captures in one worktree.
+- `<git-common-dir>/ghf/sync.lock` serializes sync runs across all worktrees.
+- `<git-dir>/ghf/operation.json` exists only while an in-place restore or apply is changing the tree, or after one was interrupted.
 - `<git-dir>/ghf/listing.json` caches this worktree's `git ls-files` result. It is reused only while the timestamps on the listed directories, the index and the ignore files are unchanged, and for at most 60 seconds.
 - `~/.config/ghf/` holds the machine id, trusted servers and credentials.

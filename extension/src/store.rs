@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     seq INTEGER NOT NULL,
     record TEXT NOT NULL,
     created_at INTEGER NOT NULL,
-    synced INTEGER NOT NULL DEFAULT 0,
+    synced INTEGER NOT NULL DEFAULT 0, -- SyncState: 0 pending, 1 synced, 2 refused
     UNIQUE(trace_id, seq)
 );
 CREATE INDEX IF NOT EXISTS checkpoints_unsynced ON checkpoints(synced, created_at);
@@ -44,6 +44,16 @@ CREATE TABLE IF NOT EXISTS hold_ops (
     name TEXT NOT NULL,
     place INTEGER NOT NULL,
     expires_at INTEGER
+);
+-- Hold operations the server refused for good, kept for `status`.
+CREATE TABLE IF NOT EXISTS refused_holds (
+    id INTEGER PRIMARY KEY,
+    at INTEGER NOT NULL,
+    trace_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    place INTEGER NOT NULL,
+    code TEXT NOT NULL,
+    message TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS failures (
     id INTEGER PRIMARY KEY,
@@ -67,7 +77,8 @@ CREATE TABLE IF NOT EXISTS idempotency (
     key TEXT PRIMARY KEY,
     fingerprint TEXT NOT NULL,
     response TEXT NOT NULL,
-    at INTEGER NOT NULL
+    at INTEGER NOT NULL,
+    state INTEGER NOT NULL DEFAULT 1 -- IdemState: 0 running, 1 succeeded, 2 failed
 );
 CREATE TABLE IF NOT EXISTS objects (
     id BLOB PRIMARY KEY,
@@ -77,6 +88,13 @@ CREATE TABLE IF NOT EXISTS objects (
 CREATE TABLE IF NOT EXISTS remote_objects (
     id BLOB PRIMARY KEY
 ) WITHOUT ROWID;
+-- Worktree contexts created on this machine, so `prune` can tell when
+-- one is gone (its context file no longer names it).
+CREATE TABLE IF NOT EXISTS contexts (
+    id TEXT PRIMARY KEY,
+    git_dir TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -118,6 +136,121 @@ pub struct TraceRow {
 /// A pending hold operation: (op id, trace, name, place, expires_at).
 pub type HoldOp = (i64, String, String, bool, Option<i64>);
 
+/// Where a run with an idempotency key stands. Stored in
+/// `idempotency.state`; only [`IdemState::code`] and
+/// [`IdemState::from_code`] know the integers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdemState {
+    /// Reserved; the command is running (or crashed).
+    Running,
+    Succeeded,
+    Failed,
+}
+
+impl IdemState {
+    pub const fn code(self) -> i64 {
+        match self {
+            Self::Running => 0,
+            Self::Succeeded => 1,
+            Self::Failed => 2,
+        }
+    }
+
+    pub fn from_code(n: i64) -> Result<Self> {
+        Ok(match n {
+            0 => Self::Running,
+            1 => Self::Succeeded,
+            2 => Self::Failed,
+            n => fail!(Internal, "unknown idempotency state {n}"),
+        })
+    }
+
+    /// A running key finishes as succeeded or failed; nothing else moves.
+    pub fn check(self, to: Self) -> Result<()> {
+        match (self, to) {
+            (Self::Running, Self::Succeeded | Self::Failed) => Ok(()),
+            (from, to) => fail!(
+                Internal,
+                "idempotency state cannot move from {from:?} to {to:?}"
+            ),
+        }
+    }
+}
+
+/// The outcome of reserving an idempotency key.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Claim {
+    /// Reserved: run the command.
+    Run,
+    /// Used before with other arguments.
+    Conflict,
+    /// Another run holds it.
+    Busy { started_at: i64, stale_at: i64 },
+    /// An earlier run succeeded with this response.
+    Succeeded(String),
+    /// An earlier run failed with this error.
+    Failed(String),
+}
+
+/// A hold operation the server refused permanently.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RefusedHold {
+    pub trace: String,
+    pub name: String,
+    /// `place` or `release`.
+    pub op: &'static str,
+    pub code: String,
+    pub message: String,
+    pub at: i64,
+}
+
+/// Where a checkpoint stands with the server. Stored in
+/// `checkpoints.synced`; [`SyncState::code`] and [`SyncState::from_code`]
+/// are the only places that know the integers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncState {
+    /// Not yet accepted by the server; retried on every sync.
+    Pending,
+    /// The server holds it (pushed from here, or pulled from there).
+    Synced,
+    /// The server refused it permanently. It stays restorable here and is
+    /// no longer retried.
+    Refused,
+}
+
+impl SyncState {
+    pub const fn code(self) -> i64 {
+        match self {
+            Self::Pending => 0,
+            Self::Synced => 1,
+            Self::Refused => 2,
+        }
+    }
+
+    pub fn from_code(n: i64) -> Result<Self> {
+        Ok(match n {
+            0 => Self::Pending,
+            1 => Self::Synced,
+            2 => Self::Refused,
+            n => fail!(Internal, "unknown checkpoint sync state {n}"),
+        })
+    }
+
+    /// Check a move to `to`. Staying put is allowed. A synced checkpoint
+    /// goes back to pending only when the sync target changes.
+    pub fn check(self, to: Self) -> Result<()> {
+        use SyncState::*;
+        match (self, to) {
+            (a, b) if a == b => Ok(()),
+            (Pending, Synced | Refused) | (Synced, Pending) => Ok(()),
+            (from, to) => fail!(
+                Internal,
+                "checkpoint sync state cannot move from {from:?} to {to:?}"
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatEntry {
     pub size: u64,
@@ -158,6 +291,18 @@ impl Store {
         // WAL checkpoints are moved off the capture path; see `maintain`.
         db.pragma_update(None, "wal_autocheckpoint", 0)?;
         db.execute_batch(SCHEMA)?;
+        // Stores from before idempotency keys had a state hold only
+        // finished, successful runs.
+        let has_state: bool = db.query_row(
+            "SELECT count(*) FROM pragma_table_info('idempotency') WHERE name = 'state'",
+            [],
+            |r| r.get::<_, i64>(0).map(|n| n > 0),
+        )?;
+        if !has_state {
+            db.execute_batch(
+                "ALTER TABLE idempotency ADD COLUMN state INTEGER NOT NULL DEFAULT 1",
+            )?;
+        }
         let store = Self { db, dir };
         if store.kv_get("arrivals_backfilled")?.is_none() {
             store.tx(|| {
@@ -367,10 +512,14 @@ impl Store {
         Ok(())
     }
 
-    /// Replace a trace record. `dirty` marks it for upload.
+    /// Replace a trace record. `dirty` marks it for upload. A trace that is
+    /// no longer open loses its writer.
     pub fn update_trace(&self, t: &TraceRecord, dirty: bool) -> Result<()> {
         self.db.execute(
-            "UPDATE traces SET record = ?2, state = ?3, dirty = MAX(dirty, ?4) WHERE id = ?1",
+            "UPDATE traces SET record = ?2, state = ?3, dirty = MAX(dirty, ?4),
+                writer = CASE WHEN ?3 = 'open' THEN writer END,
+                lease_at = CASE WHEN ?3 = 'open' THEN lease_at END
+             WHERE id = ?1",
             params![
                 t.id,
                 serde_json::to_string(t)?,
@@ -431,11 +580,64 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Claim or release a trace's writer lease. Only an open trace can be
+    /// claimed.
     pub fn set_writer(&self, trace_id: &str, writer: Option<&str>, lease_at: i64) -> Result<()> {
         self.db.execute(
-            "UPDATE traces SET writer = ?2, lease_at = ?3 WHERE id = ?1",
+            "UPDATE traces SET writer = ?2, lease_at = ?3 WHERE id = ?1 AND (state = 'open' OR ?2 IS NULL)",
             params![trace_id, writer, lease_at],
         )?;
+        Ok(())
+    }
+
+    /// Close every open trace of `context_id` (a context that is gone), to
+    /// be pushed like any close. Returns their ids.
+    pub fn close_context_traces(&self, context_id: &str, at: i64) -> Result<Vec<String>> {
+        self.tx(|| {
+            let open: Vec<TraceRow> = {
+                let mut st = self.db.prepare(
+                    "SELECT record, writer, lease_at FROM traces WHERE context_id = ?1 AND state = 'open'",
+                )?;
+                let rows = st.query_map([context_id], Self::trace_from_row)?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            let mut closed = Vec::new();
+            for row in open {
+                let mut t = row.record;
+                if t.close(at)? {
+                    self.update_trace(&t, true)?;
+                    closed.push(t.id);
+                }
+            }
+            Ok(closed)
+        })
+    }
+
+    /// Remember a context created on this machine and where its context
+    /// file lives.
+    pub fn note_context(&self, id: &str, git_dir: &Path) -> Result<()> {
+        self.db.execute(
+            "INSERT OR IGNORE INTO contexts (id, git_dir, created_at) VALUES (?1, ?2, ?3)",
+            params![id, git_dir.to_string_lossy(), ghf_proto::id::now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Contexts created on this machine: (id, git dir).
+    pub fn contexts(&self) -> Result<Vec<(String, PathBuf)>> {
+        let mut st = self.db.prepare("SELECT id, git_dir FROM contexts")?;
+        let rows = st.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                PathBuf::from(r.get::<_, String>(1)?),
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn forget_context(&self, id: &str) -> Result<()> {
+        self.db
+            .execute("DELETE FROM contexts WHERE id = ?1", [id])?;
         Ok(())
     }
 
@@ -449,11 +651,28 @@ impl Store {
             .collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Clear the dirty flag if the record has not changed since `json`.
-    pub fn mark_trace_clean(&self, t: &TraceRecord) -> Result<()> {
+    /// Take the server's merged record for a trace just pushed as `sent`,
+    /// unless it changed here meanwhile (then it stays dirty and is pushed
+    /// again). A trace pruned here stays pruned: that is a fact about this
+    /// machine's copies.
+    pub fn adopt_trace(&self, sent: &TraceRecord, merged: &TraceRecord) -> Result<()> {
+        let sent_json = serde_json::to_string(sent)?;
+        let keep = if sent.state == ghf_proto::TraceState::Pruned {
+            sent
+        } else {
+            merged
+        };
         self.db.execute(
-            "UPDATE traces SET dirty = 0 WHERE id = ?1 AND record = ?2",
-            params![t.id, serde_json::to_string(t)?],
+            "UPDATE traces SET record = ?3, state = ?4, dirty = 0,
+                writer = CASE WHEN ?4 = 'open' THEN writer END,
+                lease_at = CASE WHEN ?4 = 'open' THEN lease_at END
+             WHERE id = ?1 AND record = ?2",
+            params![
+                sent.id,
+                sent_json,
+                serde_json::to_string(keep)?,
+                keep.state.as_str()
+            ],
         )?;
         Ok(())
     }
@@ -483,12 +702,47 @@ impl Store {
         })
     }
 
-    pub fn insert_checkpoint(&self, c: &CheckpointRecord, synced: bool) -> Result<()> {
+    /// Store a checkpoint: [`SyncState::Pending`] for one captured here,
+    /// [`SyncState::Synced`] for one pulled from the server.
+    pub fn insert_checkpoint(&self, c: &CheckpointRecord, state: SyncState) -> Result<()> {
         self.db.execute(
             "INSERT OR IGNORE INTO checkpoints (id, trace_id, seq, record, created_at, synced) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![c.id, c.trace_id, c.seq, serde_json::to_string(c)?, c.created_at, synced as i64],
+            params![c.id, c.trace_id, c.seq, serde_json::to_string(c)?, c.created_at, state.code()],
         )?;
         Ok(())
+    }
+
+    pub fn sync_state(&self, id: &str) -> Result<Option<SyncState>> {
+        let code: Option<i64> = self
+            .db
+            .query_row("SELECT synced FROM checkpoints WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        code.map(SyncState::from_code).transpose()
+    }
+
+    /// Move a checkpoint to `to`, refusing an illegal move.
+    pub fn set_sync_state(&self, id: &str, to: SyncState) -> Result<()> {
+        self.tx(|| {
+            let Some(from) = self.sync_state(id)? else {
+                fail!(NotFound, "no checkpoint {id}");
+            };
+            from.check(to)?;
+            self.db.execute(
+                "UPDATE checkpoints SET synced = ?2 WHERE id = ?1",
+                params![id, to.code()],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn count_in_state(&self, state: SyncState) -> Result<i64> {
+        Ok(self.db.query_row(
+            "SELECT COUNT(*) FROM checkpoints WHERE synced = ?1",
+            [state.code()],
+            |r| r.get(0),
+        )?)
     }
 
     pub fn checkpoint(&self, id: &str) -> Result<Option<CheckpointRecord>> {
@@ -564,50 +818,93 @@ impl Store {
         )?)
     }
 
+    /// Pending checkpoints, oldest first.
     pub fn unsynced(&self) -> Result<Vec<CheckpointRecord>> {
         let mut st = self
             .db
-            .prepare("SELECT record FROM checkpoints WHERE synced = 0 ORDER BY created_at, seq")?;
-        let rows = st.query_map([], Self::ck_from_row)?;
+            .prepare("SELECT record FROM checkpoints WHERE synced = ?1 ORDER BY created_at, seq")?;
+        let rows = st.query_map([SyncState::Pending.code()], Self::ck_from_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn unsynced_count(&self) -> Result<i64> {
-        Ok(self.db.query_row(
-            "SELECT COUNT(*) FROM checkpoints WHERE synced = 0",
-            [],
-            |r| r.get(0),
-        )?)
+        self.count_in_state(SyncState::Pending)
     }
 
     pub fn unsynced_in_trace(&self, trace_id: &str) -> Result<i64> {
         Ok(self.db.query_row(
-            "SELECT COUNT(*) FROM checkpoints WHERE synced = 0 AND trace_id = ?1",
-            [trace_id],
+            "SELECT COUNT(*) FROM checkpoints WHERE synced = ?2 AND trace_id = ?1",
+            params![trace_id, SyncState::Pending.code()],
             |r| r.get(0),
         )?)
     }
 
-    /// The server refused this checkpoint permanently. It stays restorable
-    /// locally but is no longer retried (`synced = 2`).
-    pub fn mark_rejected(&self, id: &str) -> Result<()> {
-        self.db
-            .execute("UPDATE checkpoints SET synced = 2 WHERE id = ?1", [id])?;
-        Ok(())
+    /// Checkpoints of a trace that exist only on this machine: pending or
+    /// refused by the server.
+    pub fn local_only_in_trace(&self, trace_id: &str) -> Result<i64> {
+        Ok(self.db.query_row(
+            "SELECT COUNT(*) FROM checkpoints WHERE synced != ?2 AND trace_id = ?1",
+            params![trace_id, SyncState::Synced.code()],
+            |r| r.get(0),
+        )?)
     }
 
     pub fn rejected_count(&self) -> Result<i64> {
-        Ok(self.db.query_row(
-            "SELECT COUNT(*) FROM checkpoints WHERE synced = 2",
-            [],
-            |r| r.get(0),
-        )?)
+        self.count_in_state(SyncState::Refused)
     }
 
-    pub fn mark_synced(&self, id: &str) -> Result<()> {
-        self.db
-            .execute("UPDATE checkpoints SET synced = 1 WHERE id = ?1", [id])?;
-        Ok(())
+    /// Whether every object of `root` is in this store. `known` remembers
+    /// trees already found complete.
+    fn closure_present(&self, root: &ObjectId, known: &mut HashSet<ObjectId>) -> bool {
+        if known.contains(root) {
+            return true;
+        }
+        let Ok(entries) = self.tree(root) else {
+            return false;
+        };
+        for e in entries {
+            let ok = if e.mode == object::Mode::Tree {
+                self.closure_present(&e.id, known)
+            } else {
+                self.has_object(&e.id)
+            };
+            if !ok {
+                return false;
+            }
+        }
+        known.insert(*root);
+        true
+    }
+
+    /// Forget all progress with the sync target, which changed: the pull
+    /// cursor, the server's cached policy and the objects it held. Every
+    /// trace is pushed again, and so is every synced checkpoint whose
+    /// content is on this machine (one pulled and never restored cannot be).
+    pub fn reset_sync_progress(&self) -> Result<()> {
+        self.tx(|| {
+            self.kv_delete("pull_cursor")?;
+            self.kv_delete("server_policy")?;
+            self.forget_remote()?;
+            self.db
+                .execute("UPDATE traces SET dirty = 1 WHERE state != 'pruned'", [])?;
+            let synced: Vec<CheckpointRecord> = {
+                let mut st = self
+                    .db
+                    .prepare("SELECT record FROM checkpoints WHERE synced = ?1")?;
+                let rows = st.query_map([SyncState::Synced.code()], Self::ck_from_row)?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            let mut known = HashSet::new();
+            for c in synced {
+                if c.roots()
+                    .iter()
+                    .all(|r| self.closure_present(r, &mut known))
+                {
+                    self.set_sync_state(&c.id, SyncState::Pending)?;
+                }
+            }
+            Ok(())
+        })
     }
 
     // -- holds ------------------------------------------------------------------
@@ -647,6 +944,50 @@ impl Store {
         self.db
             .execute("DELETE FROM hold_ops WHERE id = ?1", [id])?;
         Ok(())
+    }
+
+    /// Drop a hold operation the server refused for good, and remember the
+    /// refusal for `status`.
+    pub fn refuse_hold_op(&self, op: &HoldOp, code: &str, message: &str) -> Result<RefusedHold> {
+        let (id, trace, name, place, _) = op;
+        let at = ghf_proto::id::now_ms();
+        self.tx(|| {
+            self.db.execute(
+                "INSERT INTO refused_holds (at, trace_id, name, place, code, message) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![at, trace, name, *place as i64, code, message],
+            )?;
+            self.remove_hold_op(*id)
+        })?;
+        Ok(RefusedHold {
+            trace: trace.clone(),
+            name: name.clone(),
+            op: if *place { "place" } else { "release" },
+            code: code.to_owned(),
+            message: message.to_owned(),
+            at,
+        })
+    }
+
+    /// Refused hold operations since `since` (unix ms), newest first.
+    pub fn refused_holds_since(&self, since: i64) -> Result<Vec<RefusedHold>> {
+        let mut st = self.db.prepare(
+            "SELECT trace_id, name, place, code, message, at FROM refused_holds WHERE at >= ?1 ORDER BY at DESC LIMIT 20",
+        )?;
+        let rows = st.query_map([since], |r| {
+            Ok(RefusedHold {
+                trace: r.get(0)?,
+                name: r.get(1)?,
+                op: if r.get::<_, i64>(2)? != 0 {
+                    "place"
+                } else {
+                    "release"
+                },
+                code: r.get(3)?,
+                message: r.get(4)?,
+                at: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     // -- failures -----------------------------------------------------------------
@@ -750,23 +1091,70 @@ impl Store {
 
     // -- idempotency and kv ------------------------------------------------------------
 
-    pub fn idempotent_response(&self, key: &str) -> Result<Option<(String, String)>> {
-        Ok(self
-            .db
-            .query_row(
-                "SELECT fingerprint, response FROM idempotency WHERE key = ?1",
-                [key],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?)
+    /// Reserve `key` for a run of the command `fingerprint`, or say what
+    /// happened to an earlier run. A reservation older than `stale_ms` is
+    /// from a run that crashed and is taken over.
+    pub fn claim_idempotent(&self, key: &str, fingerprint: &str, stale_ms: i64) -> Result<Claim> {
+        self.tx(|| {
+            let now = ghf_proto::id::now_ms();
+            let row: Option<(String, String, i64, i64)> = self
+                .db
+                .query_row(
+                    "SELECT fingerprint, response, at, state FROM idempotency WHERE key = ?1",
+                    [key],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?;
+            let Some((fp, response, at, state)) = row else {
+                self.db.execute(
+                    "INSERT INTO idempotency (key, fingerprint, response, at, state) VALUES (?1, ?2, '', ?3, ?4)",
+                    params![key, fingerprint, now, IdemState::Running.code()],
+                )?;
+                return Ok(Claim::Run);
+            };
+            if fp != fingerprint {
+                return Ok(Claim::Conflict);
+            }
+            Ok(match IdemState::from_code(state)? {
+                IdemState::Running if now.saturating_sub(at) < stale_ms => Claim::Busy {
+                    started_at: at,
+                    stale_at: at.saturating_add(stale_ms),
+                },
+                IdemState::Running => {
+                    self.db.execute(
+                        "UPDATE idempotency SET at = ?2 WHERE key = ?1",
+                        params![key, now],
+                    )?;
+                    Claim::Run
+                }
+                IdemState::Succeeded => Claim::Succeeded(response),
+                IdemState::Failed => Claim::Failed(response),
+            })
+        })
     }
 
-    pub fn save_idempotent(&self, key: &str, fingerprint: &str, response: &str) -> Result<()> {
-        self.db.execute(
-            "INSERT OR IGNORE INTO idempotency (key, fingerprint, response, at) VALUES (?1, ?2, ?3, ?4)",
-            params![key, fingerprint, response, ghf_proto::id::now_ms()],
-        )?;
-        Ok(())
+    /// Record how the run holding `key` ended: `to` is
+    /// [`IdemState::Succeeded`] or [`IdemState::Failed`]. If the key already
+    /// finished (a slow run whose reservation was taken over as stale), the
+    /// first result stands.
+    pub fn finish_idempotent(&self, key: &str, to: IdemState, response: &str) -> Result<()> {
+        self.tx(|| {
+            let state: i64 =
+                self.db
+                    .query_row("SELECT state FROM idempotency WHERE key = ?1", [key], |r| {
+                        r.get(0)
+                    })?;
+            let from = IdemState::from_code(state)?;
+            if from != IdemState::Running {
+                return Ok(());
+            }
+            from.check(to)?;
+            self.db.execute(
+                "UPDATE idempotency SET state = ?2, response = ?3, at = ?4 WHERE key = ?1",
+                params![key, to.code(), response, ghf_proto::id::now_ms()],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn kv_get(&self, key: &str) -> Result<Option<String>> {
@@ -787,5 +1175,72 @@ impl Store {
     pub fn kv_delete(&self, key: &str) -> Result<()> {
         self.db.execute("DELETE FROM kv WHERE key = ?1", [key])?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SyncState::{self, *};
+    use super::{Claim, IdemState, Store};
+
+    /// A store from before idempotency keys had a state opens as is; its
+    /// keys count as finished, successful runs.
+    #[test]
+    fn old_idempotency_tables_gain_a_state() {
+        let dir = std::env::temp_dir().join(format!("ghf-idem-{}", ghf_proto::id::random_hex(6)));
+        std::fs::create_dir_all(dir.join("ghf")).unwrap();
+        let db = rusqlite::Connection::open(dir.join("ghf/ghf.db")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE idempotency (key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, response TEXT NOT NULL, at INTEGER NOT NULL);
+             INSERT INTO idempotency VALUES ('k', 'fp', '{}', 1);",
+        )
+        .unwrap();
+        drop(db);
+        let s = Store::open(&dir).unwrap();
+        assert_eq!(
+            s.claim_idempotent("k", "fp", 1000).unwrap(),
+            Claim::Succeeded("{}".into())
+        );
+        assert_eq!(s.claim_idempotent("new", "fp", 1000).unwrap(), Claim::Run);
+        assert!(matches!(
+            s.claim_idempotent("new", "fp", 1000).unwrap(),
+            Claim::Busy { .. }
+        ));
+        s.finish_idempotent("new", IdemState::Failed, "{\"x\":1}")
+            .unwrap();
+        // A second finish (a run taken over as stale) keeps the first result.
+        s.finish_idempotent("new", IdemState::Succeeded, "{}")
+            .unwrap();
+        assert_eq!(
+            s.claim_idempotent("new", "fp", 1000).unwrap(),
+            Claim::Failed("{\"x\":1}".into())
+        );
+        assert!(IdemState::Running.check(IdemState::Running).is_err());
+        assert!(IdemState::Failed.check(IdemState::Succeeded).is_err());
+        assert_eq!(
+            s.claim_idempotent("new", "other", 1000).unwrap(),
+            Claim::Conflict
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sync_state_codes_match_stored_values() {
+        for (s, n) in [(Pending, 0), (Synced, 1), (Refused, 2)] {
+            assert_eq!(s.code(), n);
+            assert_eq!(SyncState::from_code(n).unwrap(), s);
+        }
+        assert!(SyncState::from_code(3).is_err());
+    }
+
+    #[test]
+    fn sync_state_moves() {
+        assert!(Pending.check(Synced).is_ok());
+        assert!(Pending.check(Refused).is_ok());
+        assert!(Synced.check(Pending).is_ok());
+        assert!(Synced.check(Synced).is_ok());
+        assert!(Refused.check(Synced).is_err());
+        assert!(Synced.check(Refused).is_err());
+        assert!(Refused.check(Pending).is_err());
     }
 }

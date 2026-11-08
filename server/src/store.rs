@@ -11,6 +11,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 pub type DbResult<T> = Result<T, Error>;
 
+/// Reported pending traces, plus (client, reported_at) of ignored reports.
+pub type PendingTraces = (HashSet<String>, Vec<(String, i64)>);
+
 #[derive(Debug)]
 pub struct Error {
     pub code: ghf_proto::ErrorCode,
@@ -35,6 +38,12 @@ impl From<rusqlite::Error> for Error {
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         Self::new(ghf_proto::ErrorCode::Internal, format!("I/O: {e}"))
+    }
+}
+
+impl From<ghf_proto::StateError> for Error {
+    fn from(e: ghf_proto::StateError) -> Self {
+        Self::new(ghf_proto::ErrorCode::TraceState, e.0)
     }
 }
 
@@ -487,32 +496,35 @@ impl Store {
         Ok(())
     }
 
-    /// Merge a client's view of a trace. States only move forward; holds are
-    /// managed through their own endpoints and kept from the server copy.
+    /// Merge a client's view of a trace, which must be valid. States only
+    /// move forward, through the record's own transitions; the first
+    /// finalize wins. A client cannot introduce a pruned state: only this
+    /// server prunes. Holds are managed through their own endpoints and kept
+    /// from the server copy. Returns the stored record, which tells the
+    /// client what won.
     pub fn merge_trace(&self, repo: &str, incoming: &TraceRecord) -> DbResult<TraceRecord> {
+        let incoming = incoming.unpruned();
         let merged = match self.trace(repo, &incoming.id)? {
             None => {
-                let mut t = incoming.clone();
+                let mut t = incoming;
                 t.holds.clear();
-                if t.state == TraceState::Pruned {
-                    t.state = TraceState::Closed;
-                }
                 t
             }
             Some(mut t) => {
-                let state = t.state.max(incoming.state);
-                if state == t.state && t == *incoming {
-                    return Ok(t);
-                }
+                let before = t.clone();
                 t.name = t.name.or_else(|| incoming.name.clone());
-                if t.state != TraceState::Pruned && incoming.state != TraceState::Pruned {
-                    t.state = state;
+                if incoming.state != TraceState::Open
+                    && let Some(at) = incoming.closed_at
+                    && !t.close(at)?
+                {
+                    t.closed_at = t.closed_at.or(Some(at));
                 }
-                t.closed_at = t.closed_at.or(incoming.closed_at);
-                if t.finalized_at.is_none() && incoming.finalized_at.is_some() {
-                    t.finalized_at = incoming.finalized_at;
-                    t.final_commit = incoming.final_commit.clone();
-                    t.abandoned = incoming.abandoned;
+                if let (Some(at), Some(outcome)) = (incoming.finalized_at, incoming.outcome()) {
+                    // A different, earlier finalize stays; the reply shows it.
+                    let _ = t.finalize(at, outcome);
+                }
+                if t == before {
+                    return Ok(t);
                 }
                 t
             }
@@ -707,16 +719,31 @@ impl Store {
         Ok(())
     }
 
-    pub fn pending_traces(&self, repo: &str) -> DbResult<HashSet<String>> {
+    /// Traces that clients reported as having unsynced checkpoints, from
+    /// reports sent at or after `since` (unix ms). Also returns the clients
+    /// whose older reports were ignored, with when they last reported.
+    pub fn pending_traces(&self, repo: &str, since: i64) -> DbResult<PendingTraces> {
         let mut st = self
             .db
-            .prepare("SELECT traces FROM pending WHERE repo = ?1")?;
-        let rows = st.query_map([repo], |r| r.get::<_, String>(0))?;
+            .prepare("SELECT client, traces, reported_at FROM pending WHERE repo = ?1")?;
+        let rows = st.query_map([repo], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
         let mut out = HashSet::new();
+        let mut ignored = Vec::new();
         for r in rows {
-            let v: Vec<String> = serde_json::from_str(&r?)?;
+            let (client, traces, at) = r?;
+            if at < since {
+                ignored.push((client, at));
+                continue;
+            }
+            let v: Vec<String> = serde_json::from_str(&traces)?;
             out.extend(v);
         }
-        Ok(out)
+        Ok((out, ignored))
     }
 }

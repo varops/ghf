@@ -56,6 +56,8 @@ error_codes! {
     ApplyConflict = "E_APPLY_CONFLICT" => Conflict,
     /// The same idempotency key was used with different arguments.
     IdempotencyConflict = "E_IDEMPOTENCY_CONFLICT" => Conflict,
+    /// A run with this idempotency key has not finished yet.
+    IdempotencyInProgress = "E_IDEMPOTENCY_IN_PROGRESS" => Conflict,
     /// Capture failed (strict mode surfaces this to the harness).
     CaptureFailed = "E_CAPTURE_FAILED" => Internal,
     /// Checkpoints are not yet synced to the server.

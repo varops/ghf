@@ -57,6 +57,10 @@ enum Command {
         /// How often to prune all repositories; `0s` disables.
         #[arg(long, default_value = "1h")]
         prune_interval: String,
+        /// Ignore a client's report of unsynced checkpoints when pruning
+        /// once it is older than this.
+        #[arg(long, default_value = prune::PENDING_MAX_AGE)]
+        pending_max_age: String,
     },
     /// Manage API tokens.
     #[command(subcommand)]
@@ -81,6 +85,10 @@ enum Command {
         after_finalize: String,
         #[arg(long, default_value = "90d")]
         unfinalized_cap: String,
+        /// Ignore a client's report of unsynced checkpoints once it is
+        /// older than this.
+        #[arg(long, default_value = prune::PENDING_MAX_AGE)]
+        pending_max_age: String,
     },
 }
 
@@ -194,15 +202,17 @@ fn main() {
             dry_run,
             after_finalize,
             unfinalized_cap,
+            pending_max_age,
         } => {
             let p = policy(&after_finalize, &unfinalized_cap);
+            let max_age = duration(&pending_max_age, "--pending-max-age");
             let repos = match repo {
                 Some(r) => vec![r],
                 None => store.repos().unwrap_or_else(|e| die(e.message)),
             };
             for r in repos {
-                let rep =
-                    prune::prune_repo(&store, &r, &p, dry_run).unwrap_or_else(|e| die(e.message));
+                let rep = prune::prune_repo(&store, &r, &p, max_age, dry_run)
+                    .unwrap_or_else(|e| die(e.message));
                 println!("{r}\t{}", serde_json::to_string(&rep).expect("serialize"));
             }
         }
@@ -213,14 +223,17 @@ fn main() {
             after_finalize,
             unfinalized_cap,
             prune_interval,
+            pending_max_age,
         } => {
             let p = policy(&after_finalize, &unfinalized_cap);
             let interval = duration(&prune_interval, "--prune-interval");
+            let pending_max_age_ms = duration(&pending_max_age, "--pending-max-age");
             let server_id = store.server_id().unwrap_or_else(|e| die(e.message));
             let state = Arc::new(http::AppState {
                 store: Mutex::new(store),
                 server_id: server_id.clone(),
                 policy: p,
+                pending_max_age_ms,
                 secure_cookies: tls_cert.is_some(),
             });
             let rt = tokio::runtime::Runtime::new().unwrap_or_else(|e| die(e));
@@ -253,7 +266,13 @@ async fn serve(
                 let _ = tokio::task::spawn_blocking(move || {
                     let store = s.store.lock().expect("store lock");
                     for repo in store.repos().unwrap_or_default() {
-                        match prune::prune_repo(&store, &repo, &s.policy, false) {
+                        match prune::prune_repo(
+                            &store,
+                            &repo,
+                            &s.policy,
+                            s.pending_max_age_ms,
+                            false,
+                        ) {
                             Ok(r) if !r.pruned.is_empty() => eprintln!(
                                 "ghf-server: pruned {} trace(s) in {repo}, freed {} bytes",
                                 r.pruned.len(),

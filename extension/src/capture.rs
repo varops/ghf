@@ -10,7 +10,7 @@ use serde_json::json;
 
 use crate::error::{Failure, Result};
 use crate::scan::{self, ScanOptions, Snapshot};
-use crate::store::TraceRow;
+use crate::store::{SyncState, TraceRow};
 use crate::workspace::{FileLock, Workspace};
 use crate::{err, fail};
 
@@ -88,6 +88,19 @@ pub fn checkpoint(ws: &Workspace, req: &Request) -> Result<Outcome> {
     let t = crate::timing::Timer::new();
     let _lock = lock(ws)?;
     t.mark("lock");
+    // After an interrupted in-place restore or apply, keep capturing but
+    // mark what is captured, without recording unchanged trees.
+    let marked;
+    let req = match ws.interrupted() {
+        Some(i) => {
+            let mut r = req.clone();
+            r.only_if_changed |= r.message.is_none() && r.annotations.is_empty();
+            r.annotations.insert("interrupted".into(), i.operation);
+            marked = r;
+            &marked
+        }
+        None => req,
+    };
     let out = checkpoint_locked(ws, req);
     t.mark("capture total");
     ws.store.maintain(64 * 1024 * 1024);
@@ -147,6 +160,16 @@ fn record_in_tx(
     fork: Option<&CheckpointRecord>,
 ) -> Result<Outcome> {
     let now = ghf_proto::id::now_ms();
+    // The caller read `open` before this transaction. Since then it may
+    // have been closed, finalized, or pulled as closed: only a trace that
+    // is still open takes the checkpoint; otherwise open a new one.
+    let open = match open {
+        Some(t) => ws
+            .store
+            .trace(&t.record.id)?
+            .filter(|r| r.record.state == TraceState::Open),
+        None => None,
+    };
     let latest = match &open {
         Some(t) => ws.store.latest_checkpoint(&t.record.id)?,
         None => None,
@@ -176,20 +199,13 @@ fn record_in_tx(
     let (trace, trace_created) = match open {
         Some(t) => (t.record, false),
         None => {
-            let t = TraceRecord {
-                id: ghf_proto::id::new_id(ghf_proto::id::TRACE),
-                name: req.trace_name.clone(),
-                state: TraceState::Open,
-                created_at: now,
-                context_id: ws.ctx.id.clone(),
-                forked_from: fork.map(|f| f.id.clone()),
-                closed_at: None,
-                finalized_at: None,
-                final_commit: None,
-                abandoned: false,
-                pruned_at: None,
-                holds: vec![],
-            };
+            let t = TraceRecord::open(
+                ghf_proto::id::new_id(ghf_proto::id::TRACE),
+                req.trace_name.clone(),
+                now,
+                ws.ctx.id.clone(),
+                fork.map(|f| f.id.clone()),
+            );
             ws.store.insert_trace(&t, true)?;
             (t, true)
         }
@@ -221,7 +237,7 @@ fn record_in_tx(
         skipped: snap.skipped,
         index,
     };
-    ws.store.insert_checkpoint(&ck, false)?;
+    ws.store.insert_checkpoint(&ck, SyncState::Pending)?;
     // A companion capture never claims the trace, so the next real writer
     // (an agent's hook) is not locked out.
     if !req.companion {
@@ -413,4 +429,57 @@ pub fn parse_annotations(items: &[String]) -> Result<BTreeMap<String, String>> {
         out.insert(k.to_owned(), v.to_owned());
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil;
+
+    fn req(writer: &str) -> Request {
+        Request {
+            writer: writer.into(),
+            ..Default::default()
+        }
+    }
+
+    /// A trace closed after a capture read it (by `trace close`, `trace
+    /// finalize` or a pull) takes no more checkpoints and no writer: the
+    /// capture opens a new trace instead.
+    #[test]
+    fn capture_never_appends_to_a_trace_closed_meanwhile() {
+        let (dir, ws) = testutil::workspace("closed-meanwhile");
+        std::fs::write(dir.join("a.txt"), "1").unwrap();
+        let first = checkpoint(&ws, &req("agent")).unwrap();
+        let stale = ws.store.open_trace(&ws.ctx.id).unwrap().unwrap();
+
+        // Someone closes the trace between the capture's read and its write.
+        let mut closed = stale.record.clone();
+        closed.close(ghf_proto::id::now_ms()).unwrap();
+        ws.store.update_trace(&closed, true).unwrap();
+
+        std::fs::write(dir.join("a.txt"), "2").unwrap();
+        let o = ws
+            .store
+            .tx(|| {
+                let snap = scan::scan(&ws.repo, &ws.store, &scan_options(&ws, true)?)?;
+                record(&ws, Some(stale.clone()), snap, &req("agent"), None)
+            })
+            .unwrap();
+        assert!(o.trace_created);
+        assert_ne!(o.trace.id, first.trace.id);
+        assert_eq!(ws.store.checkpoint_count(&first.trace.id).unwrap(), 1);
+        let old = ws.store.trace(&first.trace.id).unwrap().unwrap();
+        assert_eq!(old.record.state, TraceState::Closed);
+        assert_eq!(old.writer, None);
+        // Nothing can arm a writer on it afterwards either.
+        ws.store
+            .set_writer(&first.trace.id, Some("agent"), ghf_proto::id::now_ms())
+            .unwrap();
+        assert_eq!(
+            ws.store.trace(&first.trace.id).unwrap().unwrap().writer,
+            None
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

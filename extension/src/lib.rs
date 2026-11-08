@@ -17,6 +17,8 @@ mod remote;
 mod scan;
 mod store;
 mod tail;
+#[cfg(test)]
+mod testutil;
 mod timing;
 mod watch;
 mod workspace;
@@ -178,32 +180,86 @@ fn tail_main(command: &Command, json: bool) -> Result<()> {
     tail::run(&ws.store, &opts)
 }
 
-/// Run a mutating command at most once per key. A replay returns the
-/// stored data; reusing a key with different arguments is an error.
+/// The arguments that identify a command for its idempotency key: all of
+/// them except `--json` and the key option itself.
+fn fingerprint_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut args = args.into_iter();
+    while let Some(a) = args.next() {
+        if a == "--idempotency-key" {
+            args.next();
+        } else if a != "--json" && !a.starts_with("--idempotency-key=") {
+            out.push(a);
+        }
+    }
+    out
+}
+
+/// Run a mutating command at most once per key. The key is reserved before
+/// the command runs; a replay returns the stored result, success or
+/// failure; reusing a key with different arguments, or while its first run
+/// is still going, is an error.
 fn idempotent(env: &Env, key: &str, command: &Command) -> Result<(Out, bool)> {
     let repo = git::Repo::discover(&env.cwd)?;
     let store = store::Store::open(&repo.common_dir)?;
-    let args: Vec<String> = std::env::args()
-        .skip(1)
-        .filter(|a| a != "--json" && a != key && !a.starts_with("--idempotency-key"))
-        .collect();
+    let args = fingerprint_args(std::env::args().skip(1));
     let fingerprint = format!("{} {}", repo.root.display(), args.join("\u{1f}"));
-    if let Some((fp, data)) = store.idempotent_response(key)? {
-        if fp != fingerprint {
-            fail_idem(key)?;
+    let stale_ms = std::env::var("GHF_IDEMPOTENCY_STALE")
+        .ok()
+        .and_then(|s| ghf_proto::retention::parse_duration_ms(&s))
+        .unwrap_or(10 * 60 * 1000);
+    match store.claim_idempotent(key, &fingerprint, stale_ms)? {
+        store::Claim::Run => {}
+        store::Claim::Conflict => fail_idem(key)?,
+        store::Claim::Busy {
+            started_at,
+            stale_at,
+        } => {
+            return Err(Failure::new(
+                ErrorCode::IdempotencyInProgress,
+                format!(
+                    "a run with idempotency key {key:?} has not finished yet; retry when it ends"
+                ),
+            )
+            .with_data(json!({"key": key, "started_at": started_at, "stale_at": stale_at})));
         }
-        let data: serde_json::Value = serde_json::from_str(&data)?;
-        return Ok((
-            Out {
-                human: format!("already done (idempotency key {key})"),
-                data: json!({"replayed": true, "result": data}),
-            },
-            true,
-        ));
+        store::Claim::Succeeded(data) => {
+            let data: serde_json::Value = serde_json::from_str(&data)?;
+            return Ok((
+                Out {
+                    human: format!("already done (idempotency key {key})"),
+                    data: json!({"replayed": true, "result": data}),
+                },
+                true,
+            ));
+        }
+        store::Claim::Failed(stored) => {
+            let e: serde_json::Value = serde_json::from_str(&stored)?;
+            let code = e["code"]
+                .as_str()
+                .and_then(ErrorCode::parse)
+                .unwrap_or(ErrorCode::Internal);
+            return Err(
+                Failure::new(code, e["message"].as_str().unwrap_or_default().to_owned())
+                    .with_data(json!({"replayed": true, "result": e["data"]})),
+            );
+        }
     }
-    let out = dispatch(env, command)?;
-    store.save_idempotent(key, &fingerprint, &serde_json::to_string(&out.data)?)?;
-    Ok((out, false))
+    match dispatch(env, command) {
+        Ok(out) => {
+            store.finish_idempotent(
+                key,
+                store::IdemState::Succeeded,
+                &serde_json::to_string(&out.data)?,
+            )?;
+            Ok((out, false))
+        }
+        Err(f) => {
+            let stored = json!({"code": f.code, "message": f.message, "data": f.data});
+            store.finish_idempotent(key, store::IdemState::Failed, &stored.to_string())?;
+            Err(f)
+        }
+    }
 }
 
 fn fail_idem(key: &str) -> Result<()> {
@@ -349,4 +405,22 @@ fn emit_json(resp: &Response) {
         "{}",
         serde_json::to_string(resp).expect("response serializes")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fingerprint_args;
+
+    #[test]
+    fn fingerprint_drops_only_the_key_option() {
+        let args = |v: &[&str]| fingerprint_args(v.iter().map(|s| s.to_string()));
+        assert_eq!(
+            args(&["trace", "close", "k", "--idempotency-key", "k", "--json"]),
+            ["trace", "close", "k"]
+        );
+        assert_eq!(
+            args(&["--idempotency-key=k", "checkpoint", "-m", "k"]),
+            ["checkpoint", "-m", "k"]
+        );
+    }
 }
