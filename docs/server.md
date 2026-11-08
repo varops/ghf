@@ -127,3 +127,5 @@ HTTP/JSON. Repository routes live under `/v1/repos/{owner}/{name}/`. See [`proto
 - **Health check:** `GET /v1/info` needs no authentication. Use it for health checks.
 - **Content:** objects are zstd-compressed and content-addressed with BLAKE3. The server verifies every upload against its id.
 - **Checkpoint check:** a checkpoint is accepted only when its whole manifest closure is present.
+- **Trace check:** `PUT traces/{id}` refuses a record whose fields do not fit its state with `E_USAGE` (HTTP 400). An open trace has no `closed_at`, `finalized_at`, `final_commit`, `abandoned` or `pruned_at`. A closed trace has `closed_at` and no finalize or prune fields. A finalized trace has `finalized_at`, exactly one of `final_commit` and `abandoned`, and no `pruned_at`. A pruned trace has `pruned_at`.
+- **Trace merge:** states only move forward and the first finalize wins. Only the server prunes: a pushed `pruned` record is stored as `finalized` if it was finalized, else `closed`, without `pruned_at`. The reply is the stored record, so the client sees what won.

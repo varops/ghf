@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use ghf_proto::object::Mode;
 use ghf_proto::retention::{self, DAY_MS};
-use ghf_proto::{CheckpointRecord, Hold, Policy, TraceRecord, TraceState};
+use ghf_proto::{CheckpointRecord, Hold, Outcome, Policy, TraceRecord, TraceState};
 use serde_json::{Value, json};
 
 use crate::capture::{self, Request};
@@ -1231,28 +1231,21 @@ pub fn trace_close(env: &Env, trace: Option<String>) -> Result<Out> {
     let ws = env.ws()?;
     let row = resolve_trace(&ws, trace.as_deref(), env.prompt())?;
     // The new state and the cleared writer commit together.
-    let (t, was) = ws.store.tx(|| {
+    let (t, changed) = ws.store.tx(|| {
         let mut t = reread(&ws, &row.record.id)?;
-        let was = t.state;
-        if was == TraceState::Open {
-            t.state = TraceState::Closed;
-            t.closed_at = Some(ghf_proto::id::now_ms());
+        let changed = t.close(ghf_proto::id::now_ms())?;
+        if changed {
             ws.store.update_trace(&t, true)?;
         }
-        Ok((t, was))
+        Ok((t, changed))
     })?;
-    if was == TraceState::Open {
+    let human = if changed {
         remote::spawn_background(&ws);
-    }
-    let human = if was == TraceState::Open {
         format!("closed trace {}", t.id)
     } else {
-        format!("trace {} is already {}", t.id, was.as_str())
+        format!("trace {} is already {}", t.id, t.state.as_str())
     };
-    Ok(Out::new(
-        json!({"trace": t, "changed": was == TraceState::Open}),
-        human,
-    ))
+    Ok(Out::new(json!({"trace": t, "changed": changed}), human))
 }
 
 fn main_ref(ws: &Workspace) -> Result<String> {
@@ -1304,27 +1297,18 @@ pub fn trace_finalize(
         None => None,
     };
     // The new state and the cleared writer commit together.
+    let outcome = match (&sha, abandoned) {
+        (Some(c), false) => Outcome::Commit(c.clone()),
+        (None, true) => Outcome::Abandoned,
+        _ => fail!(Usage, "pass exactly one of --commit and --abandoned"),
+    };
     let (t, changed) = ws.store.tx(|| {
         let mut t = reread(&ws, &row.record.id)?;
-        match t.state {
-            TraceState::Finalized | TraceState::Pruned => {
-                if t.final_commit == sha && t.abandoned == abandoned {
-                    return Ok((t, false));
-                }
-                fail!(TraceState, "trace {} is already {}", t.id, t.state.as_str());
-            }
-            TraceState::Open | TraceState::Closed => {}
+        let changed = t.finalize(ghf_proto::id::now_ms(), outcome.clone())?;
+        if changed {
+            ws.store.update_trace(&t, true)?;
         }
-        let now = ghf_proto::id::now_ms();
-        if t.state == TraceState::Open {
-            t.closed_at = Some(now);
-        }
-        t.state = TraceState::Finalized;
-        t.finalized_at = Some(now);
-        t.final_commit = sha.clone();
-        t.abandoned = abandoned;
-        ws.store.update_trace(&t, true)?;
-        Ok((t, true))
+        Ok((t, changed))
     })?;
     if !changed {
         return Ok(Out::new(
@@ -1472,10 +1456,8 @@ fn prune_local(ws: &Workspace, dry_run: bool, has_server: bool) -> Result<Value>
             continue;
         }
         ws.store.delete_trace_rows(&t.id, &keep)?;
-        if t.state != TraceState::Pruned {
-            let mut r = t.clone();
-            r.state = TraceState::Pruned;
-            r.pruned_at = Some(now);
+        let mut r = t.clone();
+        if r.prune(now)? {
             ws.store.update_trace(&r, false)?;
         }
     }

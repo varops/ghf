@@ -8,6 +8,12 @@
 - **A refused hold no longer blocks sync.** Pinning or holding a trace that was pruned on the server, or that the server does not know, made every later `sync` fail at that hold. Such a hold is now dropped and reported in the new `refused_holds` field of `sync` and `status`. Holds on a trace this machine already knows is pruned are refused with `E_TRACE_STATE`.
 - **No checkpoints into a closed trace.** A capture that read the open trace just before `trace close`, `trace finalize` or a pull closed it could still append its checkpoint to that trace and claim it as writer. A capture now re-checks the trace inside its transaction and opens a new trace if it is no longer open; in-place restore and apply do the same. `close` and `finalize` change the record and release the writer in one transaction, and a pulled trace that is no longer open loses its writer.
 - **Changing server starts sync over.** After `init --server NEW --force`, or a changed repository, sync kept the old pull cursor (skipping the new server's history), never pushed checkpoints already synced to the old server, and kept using the old server's retention policy. Sync progress is now tied to the server URL and repository: when they change, the next sync pulls from the start and pushes every trace and every checkpoint whose content is on this machine. With no server configured, the cached server policy is ignored.
+- **A losing finalize is reported.** When two machines finalized the same trace differently, the second one's sync silently took the first one's result later. Sync now adopts the server's merged record right away and lists the trace in the new `trace_conflicts` field.
+
+### Server
+
+- **Trace records are checked.** `PUT traces/{id}` refuses a record whose fields do not fit its state with `E_USAGE`. Every state change on client and server goes through the record's own `close`, `finalize` and `prune` transitions.
+- **Clients cannot introduce a pruned trace.** A pushed `pruned` record for a trace the server did not know was stored as `closed` while keeping `pruned_at` and any finalize fields. It is now stored as `finalized` if it was finalized, else `closed`, without `pruned_at`.
 
 ## 0.1.0-rc.3 — 2026-11-04
 

@@ -204,3 +204,38 @@ fn switching_servers_resets_sync_progress() {
     b.hf(&wb, &["sync"]).ok();
     assert_eq!(log_ids(&b, &wb, &t1).len(), 2);
 }
+
+/// When two machines finalize the same trace differently, the first to
+/// reach the server wins; the other adopts that result and is told.
+#[test]
+fn a_losing_finalize_is_reported() {
+    let root = tempdir("finalize-race");
+    let server = Server::start(&root, &["--prune-interval", "0s"]);
+    let (origin, work) = repo(&root);
+    let a = connected(&root, "a", &server);
+    init(&a, &work, &server);
+    fs::write(work.join("f.txt"), "1").unwrap();
+    let trace = checkpoint(&a, &work)["trace_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    a.hf(&work, &["sync"]).ok();
+    let b = connected(&root, "b", &server);
+    let wb = clone(&origin, &root.join("b"));
+    init(&b, &wb, &server);
+    b.hf(&wb, &["sync"]).ok();
+
+    b.hf(&wb, &["trace", "finalize", &trace, "--abandoned"])
+        .ok();
+    b.hf(&wb, &["sync"]).ok();
+    let sha = git(&work, &["rev-parse", "HEAD"]);
+    a.hf(&work, &["trace", "finalize", "--commit", &sha]).ok();
+    let r = a.hf(&work, &["sync"]).ok().clone();
+    let c = &r["trace_conflicts"][0];
+    assert_eq!(c["trace"], trace.as_str(), "{r}");
+    assert_eq!(c["ours"]["final_commit"], sha.as_str());
+    assert_eq!(c["kept"]["abandoned"], true);
+    let t = a.hf(&work, &["trace", "log", &trace]).ok()["trace"].clone();
+    assert_eq!(t["abandoned"], true);
+    assert_eq!(t["final_commit"], Value::Null);
+}

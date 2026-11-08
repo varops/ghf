@@ -9,7 +9,7 @@ use ghf_proto::api::{
     ServerInfo,
 };
 use ghf_proto::object::Mode;
-use ghf_proto::{CheckpointRecord, ErrorCode, ObjectId, Policy, TraceRecord};
+use ghf_proto::{CheckpointRecord, ErrorCode, ObjectId, Policy, TraceRecord, TraceState};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -312,6 +312,32 @@ pub struct SyncReport {
     pub rejected: Vec<String>,
     /// Hold operations the server refused permanently; dropped, not retried.
     pub refused_holds: Vec<crate::store::RefusedHold>,
+    /// Traces finalized here that another machine had finalized first with
+    /// another outcome. The server's result was kept and adopted here.
+    pub trace_conflicts: Vec<TraceConflict>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TraceConflict {
+    pub trace: String,
+    pub ours: FinalState,
+    pub kept: FinalState,
+}
+
+/// How a trace was finalized.
+#[derive(Debug, Serialize)]
+pub struct FinalState {
+    pub final_commit: Option<String>,
+    pub abandoned: bool,
+}
+
+impl FinalState {
+    fn of(t: &TraceRecord) -> Self {
+        Self {
+            final_commit: t.final_commit.clone(),
+            abandoned: t.abandoned,
+        }
+    }
 }
 
 /// Errors that will not go away by retrying the same request.
@@ -472,8 +498,20 @@ pub fn sync(ws: &Workspace, remote: &Remote) -> Result<SyncReport> {
     remote.report_pending(&client, pending_traces(ws)?)?;
 
     for t in ws.store.dirty_traces()? {
-        remote.put_trace(&t)?;
-        ws.store.mark_trace_clean(&t)?;
+        let merged = remote.put_trace(&t)?;
+        // Another machine finalized it first with another outcome; its
+        // result stands.
+        if t.state == TraceState::Finalized
+            && let Some(kept) = merged.outcome()
+            && t.outcome().is_some_and(|ours| ours != kept)
+        {
+            report.trace_conflicts.push(TraceConflict {
+                trace: t.id.clone(),
+                ours: FinalState::of(&t),
+                kept: FinalState::of(&merged),
+            });
+        }
+        ws.store.adopt_trace(&t, &merged)?;
         report.pushed_traces += 1;
     }
 

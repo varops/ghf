@@ -104,6 +104,8 @@ The `hook` command is the one exception: it answers in the harness's own format.
  "holds": [{"name": "pin", "expires_at": null, "created_at": 0}]}
 ```
 
+The fields fit the state: `closed_at` from `closed` on, `finalized_at` and exactly one of `final_commit` and `abandoned` once `finalized`, and `pruned_at` once `pruned`.
+
 `trace list` and `status` add a few fields to each trace:
 - `checkpoints` and `unsynced`, both counts.
 - `writer`.
@@ -156,13 +158,14 @@ Pushes traces, checkpoints and holds, then pulls metadata from other machines.
 - **Refused checkpoints:** a checkpoint the server refuses permanently (for example, its trace was pruned there) is listed in `rejected`. It stays restorable on this machine and no longer blocks later uploads.
 - **Refused holds:** a hold change the server refuses permanently (`E_TRACE_STATE`, `E_NOT_FOUND` or `E_USAGE`, for example because its trace was pruned there) is dropped and listed in `refused_holds` as `{trace, name, op, code, message, at}`, where `op` is `place` or `release`. `status` reports it for 7 days. Other errors stop the sync and the hold is retried next time.
 - **On failure:** `data.pending` holds the count still to push.
+- **Finalize conflicts:** when another machine finalized a trace first with a different outcome, its result stands. This machine adopts it and lists the trace in `trace_conflicts` as `{trace, ours, kept}`, each `{final_commit, abandoned}`.
 - **Changing server or repository:** sync progress belongs to one server URL and repository. When `.ghf` points somewhere else (`init --server NEW --force`), the next sync starts over: it pulls the new target's history from the beginning and pushes every trace and every checkpoint again. A checkpoint pulled from the old server whose content was never fetched to this machine cannot be pushed and is left out. The old server's cached retention policy is dropped; with no server configured, only the `.ghf` `[retention]` policy applies.
 
 Data:
 
 ```text
 {pushed_traces, pushed_checkpoints, pushed_objects, pushed_bytes, hold_ops,
- pulled_traces, pulled_checkpoints, pending, rejected[], refused_holds[]}
+ pulled_traces, pulled_checkpoints, pending, rejected[], refused_holds[], trace_conflicts[]}
 ```
 
 ### `trust [URL]` · `login [--server URL]`

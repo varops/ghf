@@ -255,6 +255,7 @@ async fn put_trace(
     if t.id != id || !ghf_proto::id::is_id(ghf_proto::id::TRACE, &id) {
         return Err(bad(ErrorCode::Usage, "trace id mismatch"));
     }
+    t.validate().map_err(|e| bad(ErrorCode::Usage, e.0))?;
     let store = s.store.lock().expect("store lock");
     Ok(Json(store.merge_trace(&repo, &t)?))
 }

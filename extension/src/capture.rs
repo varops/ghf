@@ -186,20 +186,13 @@ fn record_in_tx(
     let (trace, trace_created) = match open {
         Some(t) => (t.record, false),
         None => {
-            let t = TraceRecord {
-                id: ghf_proto::id::new_id(ghf_proto::id::TRACE),
-                name: req.trace_name.clone(),
-                state: TraceState::Open,
-                created_at: now,
-                context_id: ws.ctx.id.clone(),
-                forked_from: fork.map(|f| f.id.clone()),
-                closed_at: None,
-                finalized_at: None,
-                final_commit: None,
-                abandoned: false,
-                pruned_at: None,
-                holds: vec![],
-            };
+            let t = TraceRecord::open(
+                ghf_proto::id::new_id(ghf_proto::id::TRACE),
+                req.trace_name.clone(),
+                now,
+                ws.ctx.id.clone(),
+                fork.map(|f| f.id.clone()),
+            );
             ws.store.insert_trace(&t, true)?;
             (t, true)
         }
@@ -449,8 +442,7 @@ mod tests {
 
         // Someone closes the trace between the capture's read and its write.
         let mut closed = stale.record.clone();
-        closed.state = TraceState::Closed;
-        closed.closed_at = Some(ghf_proto::id::now_ms());
+        closed.close(ghf_proto::id::now_ms()).unwrap();
         ws.store.update_trace(&closed, true).unwrap();
 
         std::fs::write(dir.join("a.txt"), "2").unwrap();

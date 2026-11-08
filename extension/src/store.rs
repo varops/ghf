@@ -524,11 +524,28 @@ impl Store {
             .collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Clear the dirty flag if the record has not changed since `json`.
-    pub fn mark_trace_clean(&self, t: &TraceRecord) -> Result<()> {
+    /// Take the server's merged record for a trace just pushed as `sent`,
+    /// unless it changed here meanwhile (then it stays dirty and is pushed
+    /// again). A trace pruned here stays pruned: that is a fact about this
+    /// machine's copies.
+    pub fn adopt_trace(&self, sent: &TraceRecord, merged: &TraceRecord) -> Result<()> {
+        let sent_json = serde_json::to_string(sent)?;
+        let keep = if sent.state == ghf_proto::TraceState::Pruned {
+            sent
+        } else {
+            merged
+        };
         self.db.execute(
-            "UPDATE traces SET dirty = 0 WHERE id = ?1 AND record = ?2",
-            params![t.id, serde_json::to_string(t)?],
+            "UPDATE traces SET record = ?3, state = ?4, dirty = 0,
+                writer = CASE WHEN ?4 = 'open' THEN writer END,
+                lease_at = CASE WHEN ?4 = 'open' THEN lease_at END
+             WHERE id = ?1 AND record = ?2",
+            params![
+                sent.id,
+                sent_json,
+                serde_json::to_string(keep)?,
+                keep.state.as_str()
+            ],
         )?;
         Ok(())
     }

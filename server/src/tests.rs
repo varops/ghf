@@ -763,3 +763,61 @@ fn old_databases_gain_the_read_only_column() {
     drop(store);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+async fn put_trace(f: &Fixture, t: &Value) -> Resp {
+    let id = t["id"].as_str().unwrap();
+    send(&f.app, json_req("PUT", &format!("traces/{id}"), &f.rw, t)).await
+}
+
+/// A client cannot introduce a pruned trace: the server keeps the state the
+/// record's other fields justify and drops `pruned_at`.
+#[tokio::test]
+async fn a_client_cannot_introduce_a_pruned_trace() {
+    let f = fixture().await;
+    let mut closed = json!(trace_record(&new_id(TRACE), None));
+    closed["state"] = json!("pruned");
+    closed["closed_at"] = json!(1);
+    closed["pruned_at"] = json!(2);
+    let r = put_trace(&f, &closed).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(r.json()["state"], "closed");
+    assert_eq!(r.json()["pruned_at"], Value::Null);
+
+    let mut finalized = closed.clone();
+    finalized["id"] = json!(new_id(TRACE));
+    finalized["finalized_at"] = json!(1);
+    finalized["abandoned"] = json!(true);
+    let r = put_trace(&f, &finalized).await;
+    assert_eq!(r.json()["state"], "finalized", "{}", r.body);
+    assert_eq!(r.json()["pruned_at"], Value::Null);
+    assert_eq!(r.json()["abandoned"], true);
+}
+
+/// Records that break the state invariants are refused.
+#[tokio::test]
+async fn invalid_trace_records_are_refused() {
+    let f = fixture().await;
+    let mut bad = Vec::new();
+    let base = json!(trace_record(&new_id(TRACE), None));
+    let mut t = base.clone();
+    t["closed_at"] = json!(1); // open with a close time
+    bad.push(t);
+    let mut t = base.clone();
+    t["state"] = json!("closed"); // closed without a close time
+    bad.push(t);
+    let mut t = base.clone();
+    t["state"] = json!("finalized"); // neither commit nor abandoned
+    t["finalized_at"] = json!(1);
+    bad.push(t);
+    let mut t = base.clone();
+    t["state"] = json!("finalized"); // both commit and abandoned
+    t["finalized_at"] = json!(1);
+    t["final_commit"] = json!("abc");
+    t["abandoned"] = json!(true);
+    bad.push(t);
+    for t in bad {
+        let r = put_trace(&f, &t).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{t}: {}", r.body);
+        assert_eq!(r.json()["code"], "E_USAGE");
+    }
+}

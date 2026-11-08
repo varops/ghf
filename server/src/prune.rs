@@ -86,8 +86,7 @@ pub fn prune_repo(
         for t in &doomed {
             store.delete_checkpoints(repo, &t.id, &keep)?;
             let mut r = t.clone();
-            r.state = TraceState::Pruned;
-            r.pruned_at = Some(now);
+            r.prune(now)?;
             store.save_trace(repo, &r)?;
         }
         tx.commit()?;
