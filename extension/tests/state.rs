@@ -453,3 +453,49 @@ fn interrupted_in_place_restore_is_reported() {
     assert_eq!(r.json["data"]["paths"][0], "e.txt");
     assert_eq!(m.hf(&work, &["status"]).ok()["interrupted"], Value::Null);
 }
+
+/// Foreground sync, prune and the pull that resolves an unknown id wait
+/// for the same lock as background sync, so two sync runs never interleave.
+#[test]
+fn foreground_sync_takes_the_sync_lock() {
+    use std::process::Stdio;
+    use std::time::Duration;
+    let root = tempdir("synclock");
+    let server = Server::start(&root, &["--prune-interval", "0s"]);
+    let (_, work) = repo(&root);
+    let a = connected(&root, "a", &server);
+    init(&a, &work, &server);
+    fs::write(work.join("f.txt"), "1").unwrap();
+    checkpoint(&a, &work);
+    let lock_path = work.join(".git/ghf/sync.lock");
+    for args in [
+        &["sync"][..],
+        &["prune", "--dry-run"][..],
+        &["trace", "log", "tr_zzzzzz"][..],
+    ] {
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        lock.lock().unwrap();
+        let mut child = a
+            .cmd(&work)
+            .args(args)
+            .arg("--json")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "{args:?} ran while another sync held the lock"
+        );
+        drop(lock);
+        child.wait().unwrap();
+    }
+    assert_eq!(a.hf(&work, &["sync"]).ok()["pending"], 0);
+}

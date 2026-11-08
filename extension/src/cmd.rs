@@ -472,6 +472,7 @@ pub fn sync(env: &Env, background: bool) -> Result<Out> {
     let Some(remote) = Remote::connect(&ws, env.prompt())? else {
         fail!(Config, "no server configured in .ghf");
     };
+    let _lock = remote::sync_lock(&ws)?;
     let r = match remote::sync(&ws, &remote) {
         Ok(r) => r,
         Err(f) => {
@@ -496,6 +497,7 @@ fn resolve_checkpoint(ws: &Workspace, r: &str, prompt: bool) -> Result<Checkpoin
     match refs::checkpoint(ws, r) {
         Err(f) if f.code == ghf_proto::ErrorCode::NotFound && !r.starts_with('@') => {
             if let Some(remote) = Remote::connect(ws, prompt)? {
+                let _lock = remote::sync_lock(ws)?;
                 remote::pull(ws, &remote, &mut remote::SyncReport::default())?;
                 return refs::checkpoint(ws, r);
             }
@@ -509,6 +511,7 @@ fn resolve_trace(ws: &Workspace, r: Option<&str>, prompt: bool) -> Result<TraceR
     match refs::trace(ws, r) {
         Err(f) if f.code == ghf_proto::ErrorCode::NotFound && r.is_some() => {
             if let Some(remote) = Remote::connect(ws, prompt)? {
+                let _lock = remote::sync_lock(ws)?;
                 remote::pull(ws, &remote, &mut remote::SyncReport::default())?;
                 return refs::trace(ws, r);
             }
@@ -1412,7 +1415,14 @@ pub fn trace_hold(
 pub fn prune(env: &Env, dry_run: bool) -> Result<Out> {
     let ws = env.ws()?;
     let mut server_report = None;
-    if let Some(remote) = Remote::connect(&ws, env.prompt())? {
+    let remote = Remote::connect(&ws, env.prompt())?;
+    // Held through the local prune too, so a background sync never pushes
+    // what is being dropped.
+    let _lock = match &remote {
+        Some(_) => Some(remote::sync_lock(&ws)?),
+        None => None,
+    };
+    if let Some(remote) = remote {
         // Push first so the server knows about everything this client holds.
         remote::sync(&ws, &remote)?;
         server_report = Some(remote.prune(dry_run)?);

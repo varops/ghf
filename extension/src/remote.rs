@@ -756,10 +756,21 @@ pub fn spawn_background(ws: &Workspace) {
     let _ = cmd.spawn();
 }
 
+fn sync_lock_path(ws: &Workspace) -> std::path::PathBuf {
+    ws.store.dir.join("sync.lock")
+}
+
+/// Wait for, then hold, the lock every sync run takes (foreground,
+/// background, prune and the pull behind an unknown id), so two runs never
+/// interleave.
+pub fn sync_lock(ws: &Workspace) -> Result<FileLock> {
+    FileLock::acquire(&sync_lock_path(ws))
+}
+
 /// Body of `git hf sync --background`: one runner at a time, repeat while
 /// new checkpoints keep arriving.
 pub fn background(ws: &Workspace) -> Result<Option<SyncReport>> {
-    let Some(_lock) = FileLock::try_acquire(&ws.store.dir.join("sync.lock"))? else {
+    let Some(_lock) = FileLock::try_acquire(&sync_lock_path(ws))? else {
         return Ok(None);
     };
     let remote = match Remote::connect(ws, false)? {

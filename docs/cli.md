@@ -162,6 +162,7 @@ Data: `{created, trace_created, checkpoint, trace}`.
 Pushes traces, checkpoints and holds, then pulls metadata from other machines.
 
 - **Content is lazy:** it is fetched on restore, diff or apply.
+- **One run at a time:** `sync`, background sync, `prune` and the pull behind an unknown reference share one lock per repository. A run waits for the one in progress (background sync skips instead).
 - **Refused checkpoints:** a checkpoint the server refuses permanently (for example, its trace was pruned there) is listed in `rejected`. It stays restorable on this machine and no longer blocks later uploads.
 - **Refused holds:** a hold change the server refuses permanently (`E_TRACE_STATE`, `E_NOT_FOUND` or `E_USAGE`, for example because its trace was pruned there) is dropped and listed in `refused_holds` as `{trace, name, op, code, message, at}`, where `op` is `place` or `release`. `status` reports it for 7 days. Other errors stop the sync and the hold is retried next time.
 - **On failure:** `data.pending` holds the count still to push.
@@ -366,6 +367,7 @@ Everything ghf keeps on a machine lives outside Git history:
 - `<git-common-dir>/ghf/ghf.db` holds the checkpoints, traces, content, stat cache and sync state. It is shared by all worktrees of the repository.
 - `<git-dir>/ghf/context.json` holds this worktree's context.
 - `<git-dir>/ghf/capture.lock` serializes captures in one worktree.
+- `<git-common-dir>/ghf/sync.lock` serializes sync runs across all worktrees.
 - `<git-dir>/ghf/operation.json` exists only while an in-place restore or apply is changing the tree, or after one was interrupted.
 - `<git-dir>/ghf/listing.json` caches this worktree's `git ls-files` result. It is reused only while the timestamps on the listed directories, the index and the ignore files are unchanged, and for at most 60 seconds.
 - `~/.config/ghf/` holds the machine id, trusted servers and credentials.
