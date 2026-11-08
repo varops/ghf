@@ -17,6 +17,8 @@ mod remote;
 mod scan;
 mod store;
 mod tail;
+#[cfg(test)]
+mod testutil;
 mod timing;
 mod watch;
 mod workspace;

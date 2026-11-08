@@ -1214,22 +1214,32 @@ pub fn trace_apply(env: &Env, range: String, write_conflicts: bool) -> Result<Ou
 // ---------------------------------------------------------------------------
 // lifecycle
 
-fn save_trace(ws: &Workspace, t: &TraceRecord) -> Result<()> {
-    ws.store.update_trace(t, true)?;
-    remote::spawn_background(ws);
-    Ok(())
+/// Re-read a trace inside a write transaction, so a change is made to its
+/// current record, not to a copy read before a concurrent capture or pull.
+fn reread(ws: &Workspace, id: &str) -> Result<TraceRecord> {
+    Ok(ws
+        .store
+        .trace(id)?
+        .ok_or_else(|| err!(NotFound, "trace {id} disappeared"))?
+        .record)
 }
 
 pub fn trace_close(env: &Env, trace: Option<String>) -> Result<Out> {
     let ws = env.ws()?;
     let row = resolve_trace(&ws, trace.as_deref(), env.prompt())?;
-    let mut t = row.record;
-    let was = t.state;
+    // The new state and the cleared writer commit together.
+    let (t, was) = ws.store.tx(|| {
+        let mut t = reread(&ws, &row.record.id)?;
+        let was = t.state;
+        if was == TraceState::Open {
+            t.state = TraceState::Closed;
+            t.closed_at = Some(ghf_proto::id::now_ms());
+            ws.store.update_trace(&t, true)?;
+        }
+        Ok((t, was))
+    })?;
     if was == TraceState::Open {
-        t.state = TraceState::Closed;
-        t.closed_at = Some(ghf_proto::id::now_ms());
-        save_trace(&ws, &t)?;
-        ws.store.set_writer(&t.id, None, 0)?;
+        remote::spawn_background(&ws);
     }
     let human = if was == TraceState::Open {
         format!("closed trace {}", t.id)
@@ -1271,7 +1281,6 @@ pub fn trace_finalize(
 ) -> Result<Out> {
     let ws = env.ws()?;
     let row = resolve_trace(&ws, trace.as_deref(), env.prompt())?;
-    let mut t = row.record;
     let sha = match &commit {
         Some(c) => {
             let sha = ws.repo.resolve_commit(c).ok_or_else(|| {
@@ -1291,28 +1300,36 @@ pub fn trace_finalize(
         }
         None => None,
     };
-    match t.state {
-        TraceState::Finalized | TraceState::Pruned => {
-            if t.final_commit == sha && t.abandoned == abandoned {
-                return Ok(Out::new(
-                    json!({"trace": t, "changed": false}),
-                    format!("trace {} is already finalized", t.id),
-                ));
+    // The new state and the cleared writer commit together.
+    let (t, changed) = ws.store.tx(|| {
+        let mut t = reread(&ws, &row.record.id)?;
+        match t.state {
+            TraceState::Finalized | TraceState::Pruned => {
+                if t.final_commit == sha && t.abandoned == abandoned {
+                    return Ok((t, false));
+                }
+                fail!(TraceState, "trace {} is already {}", t.id, t.state.as_str());
             }
-            fail!(TraceState, "trace {} is already {}", t.id, t.state.as_str());
+            TraceState::Open | TraceState::Closed => {}
         }
-        TraceState::Open | TraceState::Closed => {}
+        let now = ghf_proto::id::now_ms();
+        if t.state == TraceState::Open {
+            t.closed_at = Some(now);
+        }
+        t.state = TraceState::Finalized;
+        t.finalized_at = Some(now);
+        t.final_commit = sha.clone();
+        t.abandoned = abandoned;
+        ws.store.update_trace(&t, true)?;
+        Ok((t, true))
+    })?;
+    if !changed {
+        return Ok(Out::new(
+            json!({"trace": t, "changed": false}),
+            format!("trace {} is already finalized", t.id),
+        ));
     }
-    let now = ghf_proto::id::now_ms();
-    if t.state == TraceState::Open {
-        t.closed_at = Some(now);
-        ws.store.set_writer(&t.id, None, 0)?;
-    }
-    t.state = TraceState::Finalized;
-    t.finalized_at = Some(now);
-    t.final_commit = sha.clone();
-    t.abandoned = abandoned;
-    save_trace(&ws, &t)?;
+    remote::spawn_background(&ws);
     let human = match &sha {
         Some(s) => format!("finalized trace {} against {s}", t.id),
         None => format!("finalized trace {} as abandoned", t.id),

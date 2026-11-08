@@ -147,6 +147,16 @@ fn record_in_tx(
     fork: Option<&CheckpointRecord>,
 ) -> Result<Outcome> {
     let now = ghf_proto::id::now_ms();
+    // The caller read `open` before this transaction. Since then it may
+    // have been closed, finalized, or pulled as closed: only a trace that
+    // is still open takes the checkpoint; otherwise open a new one.
+    let open = match open {
+        Some(t) => ws
+            .store
+            .trace(&t.record.id)?
+            .filter(|r| r.record.state == TraceState::Open),
+        None => None,
+    };
     let latest = match &open {
         Some(t) => ws.store.latest_checkpoint(&t.record.id)?,
         None => None,
@@ -413,4 +423,58 @@ pub fn parse_annotations(items: &[String]) -> Result<BTreeMap<String, String>> {
         out.insert(k.to_owned(), v.to_owned());
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil;
+
+    fn req(writer: &str) -> Request {
+        Request {
+            writer: writer.into(),
+            ..Default::default()
+        }
+    }
+
+    /// A trace closed after a capture read it (by `trace close`, `trace
+    /// finalize` or a pull) takes no more checkpoints and no writer: the
+    /// capture opens a new trace instead.
+    #[test]
+    fn capture_never_appends_to_a_trace_closed_meanwhile() {
+        let (dir, ws) = testutil::workspace("closed-meanwhile");
+        std::fs::write(dir.join("a.txt"), "1").unwrap();
+        let first = checkpoint(&ws, &req("agent")).unwrap();
+        let stale = ws.store.open_trace(&ws.ctx.id).unwrap().unwrap();
+
+        // Someone closes the trace between the capture's read and its write.
+        let mut closed = stale.record.clone();
+        closed.state = TraceState::Closed;
+        closed.closed_at = Some(ghf_proto::id::now_ms());
+        ws.store.update_trace(&closed, true).unwrap();
+
+        std::fs::write(dir.join("a.txt"), "2").unwrap();
+        let o = ws
+            .store
+            .tx(|| {
+                let snap = scan::scan(&ws.repo, &ws.store, &scan_options(&ws, true)?)?;
+                record(&ws, Some(stale.clone()), snap, &req("agent"), None)
+            })
+            .unwrap();
+        assert!(o.trace_created);
+        assert_ne!(o.trace.id, first.trace.id);
+        assert_eq!(ws.store.checkpoint_count(&first.trace.id).unwrap(), 1);
+        let old = ws.store.trace(&first.trace.id).unwrap().unwrap();
+        assert_eq!(old.record.state, TraceState::Closed);
+        assert_eq!(old.writer, None);
+        // Nothing can arm a writer on it afterwards either.
+        ws.store
+            .set_writer(&first.trace.id, Some("agent"), ghf_proto::id::now_ms())
+            .unwrap();
+        assert_eq!(
+            ws.store.trace(&first.trace.id).unwrap().unwrap().writer,
+            None
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

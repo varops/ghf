@@ -6,6 +6,7 @@
 
 - **Refused checkpoints survive `prune`.** Local prune dropped a trace the server had pruned even when it held checkpoints the server refused, so they were lost although they were promised to stay restorable. A trace with pending or refused checkpoints is now kept.
 - **A refused hold no longer blocks sync.** Pinning or holding a trace that was pruned on the server, or that the server does not know, made every later `sync` fail at that hold. Such a hold is now dropped and reported in the new `refused_holds` field of `sync` and `status`. Holds on a trace this machine already knows is pruned are refused with `E_TRACE_STATE`.
+- **No checkpoints into a closed trace.** A capture that read the open trace just before `trace close`, `trace finalize` or a pull closed it could still append its checkpoint to that trace and claim it as writer. A capture now re-checks the trace inside its transaction and opens a new trace if it is no longer open; in-place restore and apply do the same. `close` and `finalize` change the record and release the writer in one transaction, and a pulled trace that is no longer open loses its writer.
 
 ## 0.1.0-rc.3 — 2026-11-04
 

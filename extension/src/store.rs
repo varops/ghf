@@ -436,10 +436,14 @@ impl Store {
         Ok(())
     }
 
-    /// Replace a trace record. `dirty` marks it for upload.
+    /// Replace a trace record. `dirty` marks it for upload. A trace that is
+    /// no longer open loses its writer.
     pub fn update_trace(&self, t: &TraceRecord, dirty: bool) -> Result<()> {
         self.db.execute(
-            "UPDATE traces SET record = ?2, state = ?3, dirty = MAX(dirty, ?4) WHERE id = ?1",
+            "UPDATE traces SET record = ?2, state = ?3, dirty = MAX(dirty, ?4),
+                writer = CASE WHEN ?3 = 'open' THEN writer END,
+                lease_at = CASE WHEN ?3 = 'open' THEN lease_at END
+             WHERE id = ?1",
             params![
                 t.id,
                 serde_json::to_string(t)?,
@@ -500,9 +504,11 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Claim or release a trace's writer lease. Only an open trace can be
+    /// claimed.
     pub fn set_writer(&self, trace_id: &str, writer: Option<&str>, lease_at: i64) -> Result<()> {
         self.db.execute(
-            "UPDATE traces SET writer = ?2, lease_at = ?3 WHERE id = ?1",
+            "UPDATE traces SET writer = ?2, lease_at = ?3 WHERE id = ?1 AND (state = 'open' OR ?2 IS NULL)",
             params![trace_id, writer, lease_at],
         )?;
         Ok(())
