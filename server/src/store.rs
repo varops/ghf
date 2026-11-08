@@ -11,6 +11,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 pub type DbResult<T> = Result<T, Error>;
 
+/// Reported pending traces, plus (client, reported_at) of ignored reports.
+pub type PendingTraces = (HashSet<String>, Vec<(String, i64)>);
+
 #[derive(Debug)]
 pub struct Error {
     pub code: ghf_proto::ErrorCode,
@@ -716,16 +719,31 @@ impl Store {
         Ok(())
     }
 
-    pub fn pending_traces(&self, repo: &str) -> DbResult<HashSet<String>> {
+    /// Traces that clients reported as having unsynced checkpoints, from
+    /// reports sent at or after `since` (unix ms). Also returns the clients
+    /// whose older reports were ignored, with when they last reported.
+    pub fn pending_traces(&self, repo: &str, since: i64) -> DbResult<PendingTraces> {
         let mut st = self
             .db
-            .prepare("SELECT traces FROM pending WHERE repo = ?1")?;
-        let rows = st.query_map([repo], |r| r.get::<_, String>(0))?;
+            .prepare("SELECT client, traces, reported_at FROM pending WHERE repo = ?1")?;
+        let rows = st.query_map([repo], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
         let mut out = HashSet::new();
+        let mut ignored = Vec::new();
         for r in rows {
-            let v: Vec<String> = serde_json::from_str(&r?)?;
+            let (client, traces, at) = r?;
+            if at < since {
+                ignored.push((client, at));
+                continue;
+            }
+            let v: Vec<String> = serde_json::from_str(&traces)?;
             out.extend(v);
         }
-        Ok(out)
+        Ok((out, ignored))
     }
 }

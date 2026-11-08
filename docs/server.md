@@ -77,7 +77,7 @@ ghf-server --data-dir /var/lib/ghf token create --name audit --repos 'acme/*' --
 
 **Pruning skips:**
 - Traces with an active hold, including `pin`.
-- Traces that any client has reported as having unsynced checkpoints.
+- Traces that any client has reported as having unsynced checkpoints. A client reports on every sync. A report older than `--pending-max-age` (default `30d`, on `serve` and `prune`) is ignored, so a client that stopped syncing cannot block pruning forever; the server logs each report it ignores.
 - Checkpoints that a retained fork was created from. These are kept so the fork stays restorable.
 
 **Per-repository overrides:**

@@ -1,7 +1,8 @@
 //! Retention: prune eligible traces and collect unreferenced objects.
 //!
 //! A trace is pruned when its retention clock has elapsed, it has no active
-//! hold, and no client reports unsynced checkpoints for it. Checkpoints that
+//! hold, and no client reports unsynced checkpoints for it. A report older
+//! than the pending max age (default 30 days) is ignored. Checkpoints that
 //! a retained fork was created from are kept, so every retained checkpoint
 //! stays restorable. Pruning never touches Git.
 
@@ -25,15 +26,27 @@ pub fn grace() -> Duration {
         })
 }
 
+/// Pending reports older than this are ignored when pruning, so a client
+/// that stopped syncing does not block pruning forever.
+pub const PENDING_MAX_AGE: &str = "30d";
+
 pub fn prune_repo(
     store: &Store,
     repo: &str,
     default: &Policy,
+    pending_max_age_ms: i64,
     dry_run: bool,
 ) -> DbResult<PruneReport> {
     let now = ghf_proto::id::now_ms();
     let policy = store.policy(repo, default)?;
-    let pending = store.pending_traces(repo)?;
+    let (pending, ignored) = store.pending_traces(repo, now.saturating_sub(pending_max_age_ms))?;
+    for (client, at) in ignored {
+        let at = std::time::UNIX_EPOCH + Duration::from_millis(at.max(0) as u64);
+        eprintln!(
+            "ghf-server: {repo}: ignoring the pending report of client {client}, last sent {}",
+            humantime::format_rfc3339_seconds(at)
+        );
+    }
     let traces = store.traces(repo)?;
     let mut report = PruneReport {
         dry_run,

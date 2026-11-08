@@ -15,6 +15,7 @@
 
 - **Trace records are checked.** `PUT traces/{id}` refuses a record whose fields do not fit its state with `E_USAGE`. Every state change on client and server goes through the record's own `close`, `finalize` and `prune` transitions.
 - **Clients cannot introduce a pruned trace.** A pushed `pruned` record for a trace the server did not know was stored as `closed` while keeping `pruned_at` and any finalize fields. It is now stored as `finalized` if it was finalized, else `closed`, without `pruned_at`.
+- **Stale pending reports expire.** A client that stopped syncing kept its report of unsynced checkpoints forever and blocked pruning of those traces. Reports older than `--pending-max-age` (default `30d`, on `serve` and `prune`) are now ignored, and each ignored report is logged.
 
 ## 0.1.0-rc.3 — 2026-11-04
 

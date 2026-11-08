@@ -172,6 +172,7 @@ async fn fixture() -> Fixture {
         store: Mutex::new(store),
         server_id: "sv_test".into(),
         policy: Policy::default(),
+        pending_max_age_ms: 30 * ghf_proto::retention::DAY_MS,
         secure_cookies: false,
     }));
 
@@ -820,4 +821,45 @@ async fn invalid_trace_records_are_refused() {
         assert_eq!(r.status, StatusCode::BAD_REQUEST, "{t}: {}", r.body);
         assert_eq!(r.json()["code"], "E_USAGE");
     }
+}
+
+/// A client that stopped syncing long ago no longer blocks pruning.
+#[test]
+fn stale_pending_reports_do_not_block_pruning() {
+    let dir = std::env::temp_dir().join(format!(
+        "ghf-server-pending-{}",
+        ghf_proto::id::random_hex(8)
+    ));
+    let store = Store::open(&dir).unwrap();
+    let repo = "acme/app";
+    let mut stale = trace_record(&new_id(TRACE), None);
+    stale.finalize(1, ghf_proto::Outcome::Abandoned).unwrap();
+    let mut fresh = stale.clone();
+    fresh.id = new_id(TRACE);
+    store.save_trace(repo, &stale).unwrap();
+    store.save_trace(repo, &fresh).unwrap();
+    store
+        .set_pending(repo, "cl_gone", &[stale.id.clone()])
+        .unwrap();
+    store
+        .set_pending(repo, "cl_live", &[fresh.id.clone()])
+        .unwrap();
+    store
+        .db
+        .execute(
+            "UPDATE pending SET reported_at = ?1 WHERE client = 'cl_gone'",
+            [now_ms() - 31 * ghf_proto::retention::DAY_MS],
+        )
+        .unwrap();
+    let r = crate::prune::prune_repo(
+        &store,
+        repo,
+        &Policy::default(),
+        30 * ghf_proto::retention::DAY_MS,
+        false,
+    )
+    .unwrap();
+    assert_eq!(r.pruned, vec![stale.id.clone()]);
+    assert_eq!(r.kept[0].id, fresh.id);
+    let _ = std::fs::remove_dir_all(dir);
 }
