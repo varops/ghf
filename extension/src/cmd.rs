@@ -277,6 +277,21 @@ pub fn status(env: &Env) -> Result<Out> {
         _ => human.push("no open trace".into()),
     }
 
+    let interrupted = ws.interrupted().map(|i| {
+        let command = i.undo_command();
+        warnings.push(format!(
+            "an in-place {} of {} was interrupted and the working tree may be partly changed{}",
+            i.operation,
+            i.target,
+            command
+                .as_deref()
+                .map(|c| format!("; undo with `{c}`"))
+                .unwrap_or_default()
+        ));
+        let mut v = serde_json::to_value(&i).unwrap_or(Value::Null);
+        v["command"] = json!(command);
+        v
+    });
     let unsynced = ws.store.unsynced_count()?;
     let failures = ws.store.failures_since(now - DAY_MS)?;
     let last_sync_error: Option<Value> = ws
@@ -365,6 +380,7 @@ pub fn status(env: &Env) -> Result<Out> {
             "unsynced": unsynced,
             "rejected": rejected,
             "refused_holds": refused_holds,
+            "interrupted": interrupted,
             "last_sync_at": last_sync_at,
             "last_sync_error": last_sync_error,
             "capture_failures": failures.iter().map(|(at, code, msg, strict)| json!({
@@ -900,7 +916,7 @@ pub fn trace_restore(
     }
     // Scan once: the guard, the pre-restore checkpoint and the restore all
     // see the same state. The checkpoint is durable before the tree changes.
-    let (current, pre) = ws.store.tx(|| {
+    let (current, pre, before) = ws.store.tx(|| {
         let snap = scan::scan(&ws.repo, &ws.store, &capture::scan_options(&ws, true)?)?;
         let latest = match &open {
             Some(t) => ws.store.latest_checkpoint(&t.record.id)?,
@@ -909,7 +925,7 @@ pub fn trace_restore(
         // With --index the index is rewritten too, so it must be captured.
         let index_clean = !index || latest.as_ref().map(|l| &l.index) == Some(&capture::index_state(&ws)?);
         if index_clean && latest.as_ref().is_some_and(|l| l.root == snap.root) {
-            return Ok((snap, None));
+            return Ok((snap, None, latest.map(|l| l.id)));
         }
         if !force {
             return Err(err!(
@@ -926,10 +942,14 @@ pub fn trace_restore(
             ..Default::default()
         };
         let o = capture::record(&ws, open.clone(), snap.clone(), &req, None)?;
-        Ok((snap, Some(o.checkpoint)))
+        let id = o.checkpoint.id.clone();
+        Ok((snap, Some(o.checkpoint), Some(id)))
     })?;
     let target = scan::flatten(&ws.store, &ck.root)?;
-    let stats = materialize::materialize(&ws.repo.root, &ws.store, &target, &current.files)?;
+    let stats =
+        materialize::materialize_with(&ws.repo.root, &ws.store, &target, &current.files, || {
+            ws.begin_operation("restore", &ck.id, before.as_deref())
+        })?;
     let mut warnings = stats.warnings.clone();
     let restaged = if index {
         restage(&ws.repo, &ws.store, &ck)?
@@ -960,6 +980,7 @@ pub fn trace_restore(
             ck.id
         );
     }
+    ws.end_operation()?;
     remote::spawn_background(&ws);
     Ok(Out::new(
         json!({
@@ -1131,7 +1152,7 @@ pub fn trace_apply(env: &Env, range: String, write_conflicts: bool) -> Result<Ou
     let deltas = scan::diff_trees(&ws.store, Some(&a.root), Some(&b.root))?;
     // Scan, merge and the pre-apply checkpoint commit together, before the
     // tree changes. A refusal rolls everything back.
-    let (current, target, conflicts, pre) = ws.store.tx(|| {
+    let (current, target, conflicts, pre, before) = ws.store.tx(|| {
         let current = scan::scan(&ws.repo, &ws.store, &capture::scan_options(&ws, true)?)?;
         let (target, conflicts) = plan_apply(&ws, &deltas, &current.files, write_conflicts)?;
         if !conflicts.is_empty() && (!write_conflicts || conflicts.iter().any(|c| c.hard)) {
@@ -1149,6 +1170,7 @@ pub fn trace_apply(env: &Env, range: String, write_conflicts: bool) -> Result<Ou
             None => None,
         };
         let mut pre = None;
+        let mut before = latest.as_ref().map(|l| l.id.clone());
         if latest.as_ref().is_none_or(|l| l.root != current.root) {
             let req = Request {
                 message: Some(format!("before apply {}..{}", a.id, b.id)),
@@ -1160,10 +1182,14 @@ pub fn trace_apply(env: &Env, range: String, write_conflicts: bool) -> Result<Ou
                     .checkpoint
                     .id,
             );
+            before = pre.clone();
         }
-        Ok((current, target, conflicts, pre))
+        Ok((current, target, conflicts, pre, before))
     })?;
-    let stats = materialize::materialize(&ws.repo.root, &ws.store, &target, &current.files)?;
+    let stats =
+        materialize::materialize_with(&ws.repo.root, &ws.store, &target, &current.files, || {
+            ws.begin_operation("apply", &format!("{}..{}", a.id, b.id), before.as_deref())
+        })?;
     let req = Request {
         message: Some(format!("applied {}..{}", a.id, b.id)),
         annotations: BTreeMap::from([
@@ -1186,6 +1212,7 @@ pub fn trace_apply(env: &Env, range: String, write_conflicts: bool) -> Result<Ou
             "worktree does not match the planned apply result (something wrote to it concurrently?); undo with `git hf trace restore {undo} --in-place --force`"
         );
     }
+    ws.end_operation()?;
     remote::spawn_background(&ws);
     let data = json!({
         "applied": true,

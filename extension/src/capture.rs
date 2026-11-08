@@ -88,6 +88,19 @@ pub fn checkpoint(ws: &Workspace, req: &Request) -> Result<Outcome> {
     let t = crate::timing::Timer::new();
     let _lock = lock(ws)?;
     t.mark("lock");
+    // After an interrupted in-place restore or apply, keep capturing but
+    // mark what is captured, without recording unchanged trees.
+    let marked;
+    let req = match ws.interrupted() {
+        Some(i) => {
+            let mut r = req.clone();
+            r.only_if_changed |= r.message.is_none() && r.annotations.is_empty();
+            r.annotations.insert("interrupted".into(), i.operation);
+            marked = r;
+            &marked
+        }
+        None => req,
+    };
     let out = checkpoint_locked(ws, req);
     t.mark("capture total");
     ws.store.maintain(64 * 1024 * 1024);

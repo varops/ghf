@@ -135,8 +135,10 @@ Data:
 
 ```text
 {repository_root, context, capture_mode, trace, latest_checkpoint, unsynced, rejected,
- refused_holds[], last_sync_at, last_sync_error, capture_failures[], server, warnings[]}
+ refused_holds[], interrupted, last_sync_at, last_sync_error, capture_failures[], server, warnings[]}
 ```
+
+`interrupted` is null, or the in-place restore or apply that stopped partway: `{operation, target, undo, started_at, command}`. `operation` is `restore` or `apply`, `target` the checkpoint or `A..B` range, `undo` the checkpoint holding the tree from before, and `command` the command that puts it back.
 
 `warnings` includes:
 - An untrusted server or missing credentials.
@@ -219,6 +221,7 @@ Runs only if the working tree matches the latest checkpoint of this worktree's o
 - **Untouched:** files ghf did not capture are never touched. That covers ignored files, skipped files and anything else not in the scan. If the checkpoint needs one of those paths, the restore is refused with `E_WORKTREE_DIRTY` and `data.paths`, before anything changes.
 - **`--index`** also restages the checkpoint's staged changes. The index then has to match the latest checkpoint too, or the restore is refused.
 - **History:** the result is recorded as a new checkpoint.
+- **Interrupted:** just before the first file changes, ghf writes `<git-dir>/ghf/operation.json` naming the operation, the target and the checkpoint to undo to. It is removed once the result is recorded. If the restore stops in between (a crash, a kill, an error), `status` reports it in `interrupted` with the undo command, and captures still run but are annotated `interrupted=restore` until a restore or apply completes.
 
 Data: `{restored_from, checkpoint, pre_restore_checkpoint, files_written, files_deleted, restaged, warnings[]}`.
 
@@ -233,6 +236,8 @@ Three-way merges the changes between two checkpoints onto the working tree. Text
 **On conflict:** it stops with `E_APPLY_CONFLICT` and leaves the tree unchanged. With `--write-conflicts`, it writes content conflicts with conflict markers instead. File/directory collisions and uncaptured files in the way always refuse, even with `--write-conflicts`.
 
 **History:** pending work is checkpointed before the apply, and the result is checkpointed after.
+
+**Interrupted:** like an in-place restore, an apply that stops partway is reported by `status` in `interrupted`, and captures are annotated `interrupted=apply` until a restore or apply completes.
 
 Data:
 
@@ -361,5 +366,6 @@ Everything ghf keeps on a machine lives outside Git history:
 - `<git-common-dir>/ghf/ghf.db` holds the checkpoints, traces, content, stat cache and sync state. It is shared by all worktrees of the repository.
 - `<git-dir>/ghf/context.json` holds this worktree's context.
 - `<git-dir>/ghf/capture.lock` serializes captures in one worktree.
+- `<git-dir>/ghf/operation.json` exists only while an in-place restore or apply is changing the tree, or after one was interrupted.
 - `<git-dir>/ghf/listing.json` caches this worktree's `git ls-files` result. It is reused only while the timestamps on the listed directories, the index and the ignore files are unchanged, and for at most 60 seconds.
 - `~/.config/ghf/` holds the machine id, trusted servers and credentials.

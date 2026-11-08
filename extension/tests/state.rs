@@ -382,3 +382,74 @@ fn idempotency_refuses_a_run_in_progress() {
     assert_eq!(r.ok()["created"], false);
     assert_eq!(m.hf(&work, &args).ok()["replayed"], true);
 }
+
+/// An in-place restore that stops halfway leaves a marker: `status` names
+/// the interrupted operation and the undo command, and captures are marked
+/// until it is resolved.
+#[test]
+fn interrupted_in_place_restore_is_reported() {
+    use ghf_proto::object::{self, Kind};
+    let root = tempdir("journal");
+    let (_, work) = repo(&root);
+    let m = Machine::new(&root, "a");
+    m.hf(&work, &["init"]).ok();
+    fs::write(work.join("f.txt"), "v1").unwrap();
+    let c1 = checkpoint(&m, &work)["id"].as_str().unwrap().to_owned();
+    fs::write(work.join("f.txt"), "v2").unwrap();
+    fs::write(work.join("e.txt"), "extra").unwrap();
+    let c2 = checkpoint(&m, &work)["id"].as_str().unwrap().to_owned();
+
+    // The restore deletes e.txt, then fails reading f.txt's old content.
+    let v1 = object::hash(Kind::Blob, b"v1");
+    let db = store_db(&work);
+    db.execute("UPDATE objects SET data = x'00' WHERE id = ?1", [&v1.0[..]])
+        .unwrap();
+    let r = m.hf(&work, &["trace", "restore", &c1, "--in-place"]);
+    assert_eq!(r.code, 1, "{}", r.stdout);
+    assert!(!work.join("e.txt").exists());
+
+    let st = m.hf(&work, &["status"]).ok().clone();
+    let i = &st["interrupted"];
+    assert_eq!(i["operation"], "restore", "{st}");
+    assert_eq!(i["target"], c1.as_str());
+    assert_eq!(i["undo"], c2.as_str());
+    let undo = format!("git hf trace restore {c2} --in-place --force");
+    assert_eq!(i["command"], undo.as_str());
+    assert!(
+        st["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains(&undo))
+    );
+    // Captures go on, marked.
+    let c = checkpoint(&m, &work);
+    assert_eq!(c["annotations"]["interrupted"], "restore", "{c}");
+
+    // Undo, and the marker is gone.
+    db.execute(
+        "UPDATE objects SET data = ?2 WHERE id = ?1",
+        rusqlite::params![&v1.0[..], object::compress(&object::raw(Kind::Blob, b"v1"))],
+    )
+    .unwrap();
+    m.hf(&work, &["trace", "restore", &c2, "--in-place", "--force"])
+        .ok();
+    assert_eq!(fs::read_to_string(work.join("e.txt")).unwrap(), "extra");
+    assert_eq!(m.hf(&work, &["status"]).ok()["interrupted"], Value::Null);
+    fs::write(work.join("f.txt"), "v3").unwrap();
+    assert_eq!(
+        checkpoint(&m, &work)["annotations"]["interrupted"],
+        Value::Null
+    );
+
+    // A restore refused before anything changes leaves no marker: an
+    // ignored file sits where the checkpoint needs e.txt.
+    fs::remove_file(work.join("e.txt")).unwrap();
+    fs::write(work.join(".gitignore"), "target/\ne.txt\n").unwrap();
+    checkpoint(&m, &work);
+    fs::write(work.join("e.txt"), "ignored").unwrap();
+    let r = m.hf(&work, &["trace", "restore", &c2, "--in-place"]);
+    assert_eq!(r.err_code(), "E_WORKTREE_DIRTY", "{}", r.stdout);
+    assert_eq!(r.json["data"]["paths"][0], "e.txt");
+    assert_eq!(m.hf(&work, &["status"]).ok()["interrupted"], Value::Null);
+}

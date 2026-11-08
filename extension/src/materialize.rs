@@ -72,6 +72,18 @@ pub fn materialize(
     target: &Manifest,
     current: &Manifest,
 ) -> Result<Stats> {
+    materialize_with(root, store, target, current, || Ok(()))
+}
+
+/// [`materialize`], calling `before_change` once every check has passed,
+/// just before the first file changes.
+pub fn materialize_with(
+    root: &Path,
+    store: &Store,
+    target: &Manifest,
+    current: &Manifest,
+    before_change: impl FnOnce() -> Result<()>,
+) -> Result<Stats> {
     // Fail before touching anything if content is missing.
     for (path, e) in target {
         if current.get(path) != Some(e) && !store.has_object(&e.id) {
@@ -93,6 +105,7 @@ pub fn materialize(
         )
         .with_data(json!({"paths": blocked})));
     }
+    before_change()?;
 
     let mut stats = Stats::default();
     let mut touched_dirs = BTreeSet::new();

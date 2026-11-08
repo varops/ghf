@@ -131,6 +131,65 @@ pub fn new_context(repo: &Repo, root: &Path, machine_id: String) -> Result<Workt
     Ok(ctx)
 }
 
+/// An in-place restore or apply that started changing the working tree.
+/// Its journal file exists from just before the tree changes until the
+/// result is recorded; if it is still there, the operation was interrupted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Interrupted {
+    /// `restore` or `apply`.
+    pub operation: String,
+    /// The checkpoint restored, or the `A..B` range applied.
+    pub target: String,
+    /// The checkpoint holding the working tree from before the operation.
+    pub undo: Option<String>,
+    pub started_at: i64,
+}
+
+impl Interrupted {
+    pub fn undo_command(&self) -> Option<String> {
+        self.undo
+            .as_ref()
+            .map(|u| format!("git hf trace restore {u} --in-place --force"))
+    }
+}
+
+impl Workspace {
+    fn journal_path(&self) -> PathBuf {
+        self.lock_path("operation.json")
+    }
+
+    /// Record, durably, that `operation` is about to change the tree.
+    pub fn begin_operation(&self, operation: &str, target: &str, undo: Option<&str>) -> Result<()> {
+        let j = Interrupted {
+            operation: operation.to_owned(),
+            target: target.to_owned(),
+            undo: undo.map(str::to_owned),
+            started_at: ghf_proto::id::now_ms(),
+        };
+        let path = self.journal_path();
+        let tmp = path.with_extension("tmp");
+        let mut f = fs::File::create(&tmp).context(|| format!("create {}", tmp.display()))?;
+        f.write_all(serde_json::to_string_pretty(&j)?.as_bytes())?;
+        f.sync_all()?;
+        fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    /// The operation finished: its result is recorded.
+    pub fn end_operation(&self) -> Result<()> {
+        match fs::remove_file(self.journal_path()) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        }
+    }
+
+    /// The in-place operation that was interrupted in this worktree, if any.
+    pub fn interrupted(&self) -> Option<Interrupted> {
+        let text = fs::read_to_string(self.journal_path()).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+}
+
 /// Exclusive advisory lock held for the life of the guard.
 pub struct FileLock(#[allow(dead_code)] fs::File);
 
