@@ -295,3 +295,90 @@ fn orphaned_open_traces_are_closed() {
     m.hf(&work, &["prune"]).ok();
     assert_eq!(trace_state(&m, &work, &t3), "open");
 }
+
+fn store_db(work: &Path) -> rusqlite::Connection {
+    rusqlite::Connection::open(work.join(".git/ghf/ghf.db")).unwrap()
+}
+
+/// An idempotency key covers the whole command line, even an argument
+/// equal to the key itself.
+#[test]
+fn idempotency_fingerprint_keeps_arguments_equal_to_the_key() {
+    let root = tempdir("idem-fp");
+    let (_, work) = repo(&root);
+    let m = Machine::new(&root, "a");
+    m.hf(&work, &["init"]).ok();
+    fs::write(work.join("f.txt"), "1").unwrap();
+    let t = checkpoint(&m, &work)["trace_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    m.hf(&work, &["trace", "close", &t, "--idempotency-key", &t])
+        .ok();
+    let r = m.hf(&work, &["trace", "close", "--idempotency-key", &t]);
+    assert_eq!(r.err_code(), "E_IDEMPOTENCY_CONFLICT", "{}", r.stdout);
+}
+
+/// A failed run is recorded too: replaying its key returns the same
+/// failure instead of acting again.
+#[test]
+fn idempotency_replays_failures() {
+    let root = tempdir("idem-fail");
+    let (_, work) = repo(&root);
+    let m = Machine::new(&root, "a");
+    m.hf(&work, &["init"]).ok();
+    fs::write(work.join("f.txt"), "1").unwrap();
+    checkpoint(&m, &work);
+    fs::write(work.join("f.txt"), "2").unwrap();
+    checkpoint(&m, &work);
+    fs::write(work.join("f.txt"), "dirty").unwrap();
+    let args = [
+        "trace",
+        "restore",
+        "@~1",
+        "--in-place",
+        "--idempotency-key",
+        "r1",
+    ];
+    assert_eq!(m.hf(&work, &args).err_code(), "E_WORKTREE_DIRTY");
+    checkpoint(&m, &work);
+    let r = m.hf(&work, &args);
+    assert_eq!(r.err_code(), "E_WORKTREE_DIRTY", "{}", r.stdout);
+    assert_eq!(r.json["data"]["replayed"], true);
+    assert_eq!(fs::read_to_string(work.join("f.txt")).unwrap(), "dirty");
+}
+
+/// A key whose first run has not finished refuses a second run; once the
+/// reservation is stale (the first run crashed), the key can be used.
+#[test]
+fn idempotency_refuses_a_run_in_progress() {
+    let root = tempdir("idem-busy");
+    let (_, work) = repo(&root);
+    let m = Machine::new(&root, "a");
+    m.hf(&work, &["init"]).ok();
+    fs::write(work.join("f.txt"), "1").unwrap();
+    let args = ["checkpoint", "--idempotency-key", "busy"];
+    // Reserve the key exactly as a run in progress would.
+    m.hf(&work, &["checkpoint", "--idempotency-key", "probe"])
+        .ok();
+    let db = store_db(&work);
+    let fp: String = db
+        .query_row(
+            "SELECT fingerprint FROM idempotency WHERE key = 'probe'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let fp = fp.replace("probe", "busy");
+    db.execute(
+        "INSERT INTO idempotency (key, fingerprint, response, at, state) VALUES ('busy', ?1, '', ?2, 0)",
+        rusqlite::params![fp, ghf_proto::id::now_ms()],
+    )
+    .unwrap();
+    let r = m.hf(&work, &args);
+    assert_eq!(r.err_code(), "E_IDEMPOTENCY_IN_PROGRESS", "{}", r.stdout);
+    assert_eq!(r.code, 4);
+    let r = m.hf_env(&work, &args, &[("GHF_IDEMPOTENCY_STALE", "0s")]);
+    assert_eq!(r.ok()["created"], false);
+    assert_eq!(m.hf(&work, &args).ok()["replayed"], true);
+}

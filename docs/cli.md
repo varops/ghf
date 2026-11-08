@@ -15,7 +15,11 @@ With `--json`, every command prints exactly one JSON object on stdout:
 - **`command`** is the stable command name: `"checkpoint"`, `"trace restore"`, and so on.
 - **`data`** is present on success. Errors may also carry it, with structured detail such as conflicts, the lock holder or pending counts.
 - **No prompts.** With `--json` or a non-TTY, ghf never prompts. Missing input is an error (`E_USAGE`).
-- **`--idempotency-key KEY`** works on any mutating command. Repeating it with the same arguments returns `{"replayed": true, "result": <first data>}` without acting again. Repeating it with different arguments returns `E_IDEMPOTENCY_CONFLICT`.
+- **`--idempotency-key KEY`** works on any mutating command. The key is reserved before the command runs.
+  - **Same arguments, after success:** returns `{"replayed": true, "result": <first data>}` without acting again.
+  - **Same arguments, after failure:** returns the same error, with `data` `{"replayed": true, "result": <first error data>}`, without acting again.
+  - **Different arguments:** `E_IDEMPOTENCY_CONFLICT`. Every argument counts, even one equal to the key.
+  - **While the first run is still going:** `E_IDEMPOTENCY_IN_PROGRESS`. A reservation older than `GHF_IDEMPOTENCY_STALE` (default `10m`) is taken to be from a run that crashed, and the key runs again.
 
 The `hook` command is the one exception: it answers in the harness's own format.
 
@@ -51,6 +55,7 @@ The `hook` command is the one exception: it answers in the harness's own format.
 | `E_COMMIT_NOT_REACHABLE` | 3 | Commit is not reachable from the main ref |
 | `E_APPLY_CONFLICT` | 4 | Apply conflicts; `data.conflicts[]` of `{path, reason}`, `data.applied` |
 | `E_IDEMPOTENCY_CONFLICT` | 4 | Key reused with different arguments |
+| `E_IDEMPOTENCY_IN_PROGRESS` | 4 | A run with this key has not finished; `data.started_at`, `data.stale_at` |
 | `E_NOT_SYNCED` | 5 | Checkpoints not yet on the server |
 | `E_UNTRUSTED_SERVER` | 5 | Server not trusted on this machine; run `ghf trust` |
 | `E_AUTH` | 5 | Missing or rejected credentials |
@@ -345,6 +350,7 @@ unfinalized_cap = "90d"
 | `GHF_CONFIG_DIR` | User config directory (default `$XDG_CONFIG_HOME/ghf` or `~/.config/ghf`) |
 | `GHF_ALLOW_INSECURE` | `1` allows plain `http://` to non-local hosts |
 | `GHF_GC_GRACE` | Minimum object age before local GC deletes it (default `1h`) |
+| `GHF_IDEMPOTENCY_STALE` | Age after which an unfinished idempotency key counts as crashed and may run again (default `10m`) |
 | `GHF_TIMING` | Print capture phase timings to stderr |
 | `GHF_NO_LISTING_CACHE` | Ask git for the file list on every capture instead of reusing it |
 

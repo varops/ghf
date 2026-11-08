@@ -77,7 +77,8 @@ CREATE TABLE IF NOT EXISTS idempotency (
     key TEXT PRIMARY KEY,
     fingerprint TEXT NOT NULL,
     response TEXT NOT NULL,
-    at INTEGER NOT NULL
+    at INTEGER NOT NULL,
+    state INTEGER NOT NULL DEFAULT 1 -- IdemState: 0 running, 1 succeeded, 2 failed
 );
 CREATE TABLE IF NOT EXISTS objects (
     id BLOB PRIMARY KEY,
@@ -134,6 +135,62 @@ pub struct TraceRow {
 
 /// A pending hold operation: (op id, trace, name, place, expires_at).
 pub type HoldOp = (i64, String, String, bool, Option<i64>);
+
+/// Where a run with an idempotency key stands. Stored in
+/// `idempotency.state`; only [`IdemState::code`] and
+/// [`IdemState::from_code`] know the integers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdemState {
+    /// Reserved; the command is running (or crashed).
+    Running,
+    Succeeded,
+    Failed,
+}
+
+impl IdemState {
+    pub const fn code(self) -> i64 {
+        match self {
+            Self::Running => 0,
+            Self::Succeeded => 1,
+            Self::Failed => 2,
+        }
+    }
+
+    pub fn from_code(n: i64) -> Result<Self> {
+        Ok(match n {
+            0 => Self::Running,
+            1 => Self::Succeeded,
+            2 => Self::Failed,
+            n => fail!(Internal, "unknown idempotency state {n}"),
+        })
+    }
+
+    /// A running key finishes as succeeded or failed; nothing else moves.
+    pub fn check(self, to: Self) -> Result<()> {
+        match (self, to) {
+            (Self::Running, Self::Succeeded | Self::Failed) => Ok(()),
+            (from, to) => fail!(
+                Internal,
+                "idempotency state cannot move from {from:?} to {to:?}"
+            ),
+        }
+    }
+}
+
+/// The outcome of reserving an idempotency key.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Claim {
+    /// Reserved: run the command.
+    Run,
+    /// Used before with other arguments.
+    Conflict,
+    /// Another run holds it.
+    Busy { started_at: i64, stale_at: i64 },
+    /// An earlier run succeeded with this response.
+    Succeeded(String),
+    /// An earlier run failed with this error.
+    Failed(String),
+}
 
 /// A hold operation the server refused permanently.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -234,6 +291,18 @@ impl Store {
         // WAL checkpoints are moved off the capture path; see `maintain`.
         db.pragma_update(None, "wal_autocheckpoint", 0)?;
         db.execute_batch(SCHEMA)?;
+        // Stores from before idempotency keys had a state hold only
+        // finished, successful runs.
+        let has_state: bool = db.query_row(
+            "SELECT count(*) FROM pragma_table_info('idempotency') WHERE name = 'state'",
+            [],
+            |r| r.get::<_, i64>(0).map(|n| n > 0),
+        )?;
+        if !has_state {
+            db.execute_batch(
+                "ALTER TABLE idempotency ADD COLUMN state INTEGER NOT NULL DEFAULT 1",
+            )?;
+        }
         let store = Self { db, dir };
         if store.kv_get("arrivals_backfilled")?.is_none() {
             store.tx(|| {
@@ -1022,23 +1091,70 @@ impl Store {
 
     // -- idempotency and kv ------------------------------------------------------------
 
-    pub fn idempotent_response(&self, key: &str) -> Result<Option<(String, String)>> {
-        Ok(self
-            .db
-            .query_row(
-                "SELECT fingerprint, response FROM idempotency WHERE key = ?1",
-                [key],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?)
+    /// Reserve `key` for a run of the command `fingerprint`, or say what
+    /// happened to an earlier run. A reservation older than `stale_ms` is
+    /// from a run that crashed and is taken over.
+    pub fn claim_idempotent(&self, key: &str, fingerprint: &str, stale_ms: i64) -> Result<Claim> {
+        self.tx(|| {
+            let now = ghf_proto::id::now_ms();
+            let row: Option<(String, String, i64, i64)> = self
+                .db
+                .query_row(
+                    "SELECT fingerprint, response, at, state FROM idempotency WHERE key = ?1",
+                    [key],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?;
+            let Some((fp, response, at, state)) = row else {
+                self.db.execute(
+                    "INSERT INTO idempotency (key, fingerprint, response, at, state) VALUES (?1, ?2, '', ?3, ?4)",
+                    params![key, fingerprint, now, IdemState::Running.code()],
+                )?;
+                return Ok(Claim::Run);
+            };
+            if fp != fingerprint {
+                return Ok(Claim::Conflict);
+            }
+            Ok(match IdemState::from_code(state)? {
+                IdemState::Running if now.saturating_sub(at) < stale_ms => Claim::Busy {
+                    started_at: at,
+                    stale_at: at.saturating_add(stale_ms),
+                },
+                IdemState::Running => {
+                    self.db.execute(
+                        "UPDATE idempotency SET at = ?2 WHERE key = ?1",
+                        params![key, now],
+                    )?;
+                    Claim::Run
+                }
+                IdemState::Succeeded => Claim::Succeeded(response),
+                IdemState::Failed => Claim::Failed(response),
+            })
+        })
     }
 
-    pub fn save_idempotent(&self, key: &str, fingerprint: &str, response: &str) -> Result<()> {
-        self.db.execute(
-            "INSERT OR IGNORE INTO idempotency (key, fingerprint, response, at) VALUES (?1, ?2, ?3, ?4)",
-            params![key, fingerprint, response, ghf_proto::id::now_ms()],
-        )?;
-        Ok(())
+    /// Record how the run holding `key` ended: `to` is
+    /// [`IdemState::Succeeded`] or [`IdemState::Failed`]. If the key already
+    /// finished (a slow run whose reservation was taken over as stale), the
+    /// first result stands.
+    pub fn finish_idempotent(&self, key: &str, to: IdemState, response: &str) -> Result<()> {
+        self.tx(|| {
+            let state: i64 =
+                self.db
+                    .query_row("SELECT state FROM idempotency WHERE key = ?1", [key], |r| {
+                        r.get(0)
+                    })?;
+            let from = IdemState::from_code(state)?;
+            if from != IdemState::Running {
+                return Ok(());
+            }
+            from.check(to)?;
+            self.db.execute(
+                "UPDATE idempotency SET state = ?2, response = ?3, at = ?4 WHERE key = ?1",
+                params![key, to.code(), response, ghf_proto::id::now_ms()],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn kv_get(&self, key: &str) -> Result<Option<String>> {
@@ -1065,6 +1181,48 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::SyncState::{self, *};
+    use super::{Claim, IdemState, Store};
+
+    /// A store from before idempotency keys had a state opens as is; its
+    /// keys count as finished, successful runs.
+    #[test]
+    fn old_idempotency_tables_gain_a_state() {
+        let dir = std::env::temp_dir().join(format!("ghf-idem-{}", ghf_proto::id::random_hex(6)));
+        std::fs::create_dir_all(dir.join("ghf")).unwrap();
+        let db = rusqlite::Connection::open(dir.join("ghf/ghf.db")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE idempotency (key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, response TEXT NOT NULL, at INTEGER NOT NULL);
+             INSERT INTO idempotency VALUES ('k', 'fp', '{}', 1);",
+        )
+        .unwrap();
+        drop(db);
+        let s = Store::open(&dir).unwrap();
+        assert_eq!(
+            s.claim_idempotent("k", "fp", 1000).unwrap(),
+            Claim::Succeeded("{}".into())
+        );
+        assert_eq!(s.claim_idempotent("new", "fp", 1000).unwrap(), Claim::Run);
+        assert!(matches!(
+            s.claim_idempotent("new", "fp", 1000).unwrap(),
+            Claim::Busy { .. }
+        ));
+        s.finish_idempotent("new", IdemState::Failed, "{\"x\":1}")
+            .unwrap();
+        // A second finish (a run taken over as stale) keeps the first result.
+        s.finish_idempotent("new", IdemState::Succeeded, "{}")
+            .unwrap();
+        assert_eq!(
+            s.claim_idempotent("new", "fp", 1000).unwrap(),
+            Claim::Failed("{\"x\":1}".into())
+        );
+        assert!(IdemState::Running.check(IdemState::Running).is_err());
+        assert!(IdemState::Failed.check(IdemState::Succeeded).is_err());
+        assert_eq!(
+            s.claim_idempotent("new", "other", 1000).unwrap(),
+            Claim::Conflict
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn sync_state_codes_match_stored_values() {
