@@ -709,6 +709,60 @@ impl Store {
         self.count_in_state(SyncState::Refused)
     }
 
+    /// Whether every object of `root` is in this store. `known` remembers
+    /// trees already found complete.
+    fn closure_present(&self, root: &ObjectId, known: &mut HashSet<ObjectId>) -> bool {
+        if known.contains(root) {
+            return true;
+        }
+        let Ok(entries) = self.tree(root) else {
+            return false;
+        };
+        for e in entries {
+            let ok = if e.mode == object::Mode::Tree {
+                self.closure_present(&e.id, known)
+            } else {
+                self.has_object(&e.id)
+            };
+            if !ok {
+                return false;
+            }
+        }
+        known.insert(*root);
+        true
+    }
+
+    /// Forget all progress with the sync target, which changed: the pull
+    /// cursor, the server's cached policy and the objects it held. Every
+    /// trace is pushed again, and so is every synced checkpoint whose
+    /// content is on this machine (one pulled and never restored cannot be).
+    pub fn reset_sync_progress(&self) -> Result<()> {
+        self.tx(|| {
+            self.kv_delete("pull_cursor")?;
+            self.kv_delete("server_policy")?;
+            self.forget_remote()?;
+            self.db
+                .execute("UPDATE traces SET dirty = 1 WHERE state != 'pruned'", [])?;
+            let synced: Vec<CheckpointRecord> = {
+                let mut st = self
+                    .db
+                    .prepare("SELECT record FROM checkpoints WHERE synced = ?1")?;
+                let rows = st.query_map([SyncState::Synced.code()], Self::ck_from_row)?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            let mut known = HashSet::new();
+            for c in synced {
+                if c.roots()
+                    .iter()
+                    .all(|r| self.closure_present(r, &mut known))
+                {
+                    self.set_sync_state(&c.id, SyncState::Pending)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
     // -- holds ------------------------------------------------------------------
 
     pub fn add_hold_op(

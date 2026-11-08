@@ -156,6 +156,7 @@ Pushes traces, checkpoints and holds, then pulls metadata from other machines.
 - **Refused checkpoints:** a checkpoint the server refuses permanently (for example, its trace was pruned there) is listed in `rejected`. It stays restorable on this machine and no longer blocks later uploads.
 - **Refused holds:** a hold change the server refuses permanently (`E_TRACE_STATE`, `E_NOT_FOUND` or `E_USAGE`, for example because its trace was pruned there) is dropped and listed in `refused_holds` as `{trace, name, op, code, message, at}`, where `op` is `place` or `release`. `status` reports it for 7 days. Other errors stop the sync and the hold is retried next time.
 - **On failure:** `data.pending` holds the count still to push.
+- **Changing server or repository:** sync progress belongs to one server URL and repository. When `.ghf` points somewhere else (`init --server NEW --force`), the next sync starts over: it pulls the new target's history from the beginning and pushes every trace and every checkpoint again. A checkpoint pulled from the old server whose content was never fetched to this machine cannot be pushed and is left out. The old server's cached retention policy is dropped; with no server configured, only the `.ghf` `[retention]` policy applies.
 
 Data:
 

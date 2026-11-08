@@ -126,3 +126,81 @@ fn refused_hold_ops_do_not_block_sync() {
     assert_eq!(r.err_code(), "E_TRACE_STATE");
     assert_eq!(a.hf(&work, &["sync"]).ok()["hold_ops"], 0);
 }
+
+fn trace_ids(m: &Machine, dir: &Path, env: &[(&str, &str)]) -> Vec<Value> {
+    m.hf_env(dir, &["trace", "list", "--all"], env).ok()["traces"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+/// Sync progress belongs to one server and repository. Pointing the
+/// repository at another server pulls that server's history from the start
+/// and pushes everything again; the old server's policy no longer applies.
+#[test]
+fn switching_servers_resets_sync_progress() {
+    let root = tempdir("switch");
+    fs::create_dir_all(root.join("s1")).unwrap();
+    fs::create_dir_all(root.join("s2")).unwrap();
+    let s1 = Server::start(
+        &root.join("s1"),
+        &["--after-finalize", "0s", "--prune-interval", "0s"],
+    );
+    let s2 = Server::start(&root.join("s2"), &["--prune-interval", "0s"]);
+    let (origin, work) = repo(&root);
+    let a = connected(&root, "a", &s1);
+    init(&a, &work, &s1);
+    fs::write(work.join("f.txt"), "1").unwrap();
+    let c1 = checkpoint(&a, &work);
+    let t1 = c1["trace_id"].as_str().unwrap().to_owned();
+    fs::write(work.join("f.txt"), "2").unwrap();
+    checkpoint(&a, &work);
+    a.hf(&work, &["trace", "finalize", "--abandoned"]).ok();
+    a.hf(&work, &["sync"]).ok();
+    let eligible = |env: &[(&str, &str)]| {
+        trace_ids(&a, &work, env)
+            .iter()
+            .find(|t| t["id"] == t1.as_str())
+            .unwrap()["retention"]["eligible"]
+            .clone()
+    };
+    assert_eq!(eligible(&[]), true);
+
+    // Without a server, the old server's policy does not apply.
+    a.hf(&work, &["init", "--strict", "--force"]).ok();
+    assert_eq!(eligible(&[]), false);
+
+    // Another machine already works against the second server.
+    let b = connected(&root, "b", &s2);
+    let wb = clone(&origin, &root.join("b"));
+    init(&b, &wb, &s2);
+    fs::write(wb.join("g.txt"), "b").unwrap();
+    let tb = checkpoint(&b, &wb)["trace_id"].as_str().unwrap().to_owned();
+    b.hf(&wb, &["sync"]).ok();
+
+    let env = [("GHF_TOKEN", s2.token.as_str())];
+    a.hf_env(
+        &work,
+        &[
+            "init",
+            "--server",
+            &s2.url,
+            "--repository",
+            "acme/proj",
+            "--trust",
+            "--force",
+        ],
+        &env,
+    )
+    .ok();
+    let r = a.hf_env(&work, &["sync"], &env).ok().clone();
+    assert_eq!(r["pushed_checkpoints"], 2, "{r}");
+    assert!(
+        trace_ids(&a, &work, &env)
+            .iter()
+            .any(|t| t["id"] == tb.as_str()),
+        "the second server's traces are pulled from the start"
+    );
+    b.hf(&wb, &["sync"]).ok();
+    assert_eq!(log_ids(&b, &wb, &t1).len(), 2);
+}

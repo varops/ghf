@@ -72,8 +72,11 @@ fn trace_json(ws: &Workspace, t: &TraceRow, policy: &Policy) -> Result<Value> {
     Ok(v)
 }
 
+/// The retention policy: the server's, as cached by the last sync with the
+/// configured server, else the `.ghf` policy.
 fn policy(ws: &Workspace) -> Result<Policy> {
-    if let Some(p) = ws.store.kv_get("server_policy")?
+    if remote::cached_policy_applies(ws)?
+        && let Some(p) = ws.store.kv_get("server_policy")?
         && let Ok(p) = serde_json::from_str(&p)
     {
         return Ok(p);

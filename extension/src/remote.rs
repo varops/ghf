@@ -322,6 +322,46 @@ fn permanent(code: ErrorCode) -> bool {
     )
 }
 
+/// What sync progress belongs to: the server URL and the repository on it.
+/// The pull cursor, which checkpoints count as synced, the cache of objects
+/// the server holds and its cached policy are only valid for this target.
+fn sync_identity(url: &str, repo: &str) -> String {
+    format!("{url} {repo}")
+}
+
+/// Whether the cached server policy belongs to the configured server.
+pub fn cached_policy_applies(ws: &Workspace) -> Result<bool> {
+    let Some(server) = &ws.cfg.server else {
+        return Ok(false);
+    };
+    let Ok(url) = config::normalize_url(&server.url) else {
+        return Ok(false);
+    };
+    Ok(match ws.store.kv_get("sync_identity")? {
+        Some(id) => id == sync_identity(&url, &server.repository),
+        // Stores from before the identity was recorded.
+        None => true,
+    })
+}
+
+/// Tie the store's sync progress to `remote`. When the target changed since
+/// the last sync, start over: pull from the beginning, push every trace and
+/// every checkpoint whose content is on this machine again, forget which
+/// objects the old server held and its policy.
+fn bind_identity(ws: &Workspace, remote: &Remote) -> Result<()> {
+    let id = sync_identity(&remote.url, &remote.repo);
+    match ws.store.kv_get("sync_identity")? {
+        Some(old) if old == id => Ok(()),
+        // A store from before the identity was recorded: its progress
+        // belongs to the server it was syncing with, the configured one.
+        None => ws.store.kv_set("sync_identity", &id),
+        Some(_) => ws.store.tx(|| {
+            ws.store.reset_sync_progress()?;
+            ws.store.kv_set("sync_identity", &id)
+        }),
+    }
+}
+
 fn client_id(ws: &Workspace) -> Result<String> {
     if let Some(id) = ws.store.kv_get("client_id")? {
         return Ok(id);
@@ -426,6 +466,7 @@ fn upload_closure(
 
 /// Push everything pending, then pull remote metadata.
 pub fn sync(ws: &Workspace, remote: &Remote) -> Result<SyncReport> {
+    bind_identity(ws, remote)?;
     let mut report = SyncReport::default();
     let client = client_id(ws)?;
     remote.report_pending(&client, pending_traces(ws)?)?;
@@ -516,6 +557,7 @@ pub fn sync(ws: &Workspace, remote: &Remote) -> Result<SyncReport> {
 
 /// Pull trace and checkpoint metadata. Content is fetched lazily.
 pub fn pull(ws: &Workspace, remote: &Remote, report: &mut SyncReport) -> Result<()> {
+    bind_identity(ws, remote)?;
     let mut since: i64 = ws
         .store
         .kv_get("pull_cursor")?
