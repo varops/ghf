@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Refused checkpoints survive `prune`.** Local prune dropped a trace the server had pruned even when it held checkpoints the server refused, so they were lost although they were promised to stay restorable. A trace with pending or refused checkpoints is now kept.
+
 ## 0.1.0-rc.3 — 2026-11-04
 
 ### Added

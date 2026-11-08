@@ -10,7 +10,7 @@ use serde_json::json;
 
 use crate::error::{Failure, Result};
 use crate::scan::{self, ScanOptions, Snapshot};
-use crate::store::TraceRow;
+use crate::store::{SyncState, TraceRow};
 use crate::workspace::{FileLock, Workspace};
 use crate::{err, fail};
 
@@ -221,7 +221,7 @@ fn record_in_tx(
         skipped: snap.skipped,
         index,
     };
-    ws.store.insert_checkpoint(&ck, false)?;
+    ws.store.insert_checkpoint(&ck, SyncState::Pending)?;
     // A companion capture never claims the trace, so the next real writer
     // (an agent's hook) is not locked out.
     if !req.companion {

@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     seq INTEGER NOT NULL,
     record TEXT NOT NULL,
     created_at INTEGER NOT NULL,
-    synced INTEGER NOT NULL DEFAULT 0,
+    synced INTEGER NOT NULL DEFAULT 0, -- SyncState: 0 pending, 1 synced, 2 refused
     UNIQUE(trace_id, seq)
 );
 CREATE INDEX IF NOT EXISTS checkpoints_unsynced ON checkpoints(synced, created_at);
@@ -117,6 +117,53 @@ pub struct TraceRow {
 
 /// A pending hold operation: (op id, trace, name, place, expires_at).
 pub type HoldOp = (i64, String, String, bool, Option<i64>);
+
+/// Where a checkpoint stands with the server. Stored in
+/// `checkpoints.synced`; [`SyncState::code`] and [`SyncState::from_code`]
+/// are the only places that know the integers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncState {
+    /// Not yet accepted by the server; retried on every sync.
+    Pending,
+    /// The server holds it (pushed from here, or pulled from there).
+    Synced,
+    /// The server refused it permanently. It stays restorable here and is
+    /// no longer retried.
+    Refused,
+}
+
+impl SyncState {
+    pub const fn code(self) -> i64 {
+        match self {
+            Self::Pending => 0,
+            Self::Synced => 1,
+            Self::Refused => 2,
+        }
+    }
+
+    pub fn from_code(n: i64) -> Result<Self> {
+        Ok(match n {
+            0 => Self::Pending,
+            1 => Self::Synced,
+            2 => Self::Refused,
+            n => fail!(Internal, "unknown checkpoint sync state {n}"),
+        })
+    }
+
+    /// Check a move to `to`. Staying put is allowed. A synced checkpoint
+    /// goes back to pending only when the sync target changes.
+    pub fn check(self, to: Self) -> Result<()> {
+        use SyncState::*;
+        match (self, to) {
+            (a, b) if a == b => Ok(()),
+            (Pending, Synced | Refused) | (Synced, Pending) => Ok(()),
+            (from, to) => fail!(
+                Internal,
+                "checkpoint sync state cannot move from {from:?} to {to:?}"
+            ),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatEntry {
@@ -483,12 +530,47 @@ impl Store {
         })
     }
 
-    pub fn insert_checkpoint(&self, c: &CheckpointRecord, synced: bool) -> Result<()> {
+    /// Store a checkpoint: [`SyncState::Pending`] for one captured here,
+    /// [`SyncState::Synced`] for one pulled from the server.
+    pub fn insert_checkpoint(&self, c: &CheckpointRecord, state: SyncState) -> Result<()> {
         self.db.execute(
             "INSERT OR IGNORE INTO checkpoints (id, trace_id, seq, record, created_at, synced) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![c.id, c.trace_id, c.seq, serde_json::to_string(c)?, c.created_at, synced as i64],
+            params![c.id, c.trace_id, c.seq, serde_json::to_string(c)?, c.created_at, state.code()],
         )?;
         Ok(())
+    }
+
+    pub fn sync_state(&self, id: &str) -> Result<Option<SyncState>> {
+        let code: Option<i64> = self
+            .db
+            .query_row("SELECT synced FROM checkpoints WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        code.map(SyncState::from_code).transpose()
+    }
+
+    /// Move a checkpoint to `to`, refusing an illegal move.
+    pub fn set_sync_state(&self, id: &str, to: SyncState) -> Result<()> {
+        self.tx(|| {
+            let Some(from) = self.sync_state(id)? else {
+                fail!(NotFound, "no checkpoint {id}");
+            };
+            from.check(to)?;
+            self.db.execute(
+                "UPDATE checkpoints SET synced = ?2 WHERE id = ?1",
+                params![id, to.code()],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn count_in_state(&self, state: SyncState) -> Result<i64> {
+        Ok(self.db.query_row(
+            "SELECT COUNT(*) FROM checkpoints WHERE synced = ?1",
+            [state.code()],
+            |r| r.get(0),
+        )?)
     }
 
     pub fn checkpoint(&self, id: &str) -> Result<Option<CheckpointRecord>> {
@@ -564,50 +646,39 @@ impl Store {
         )?)
     }
 
+    /// Pending checkpoints, oldest first.
     pub fn unsynced(&self) -> Result<Vec<CheckpointRecord>> {
         let mut st = self
             .db
-            .prepare("SELECT record FROM checkpoints WHERE synced = 0 ORDER BY created_at, seq")?;
-        let rows = st.query_map([], Self::ck_from_row)?;
+            .prepare("SELECT record FROM checkpoints WHERE synced = ?1 ORDER BY created_at, seq")?;
+        let rows = st.query_map([SyncState::Pending.code()], Self::ck_from_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn unsynced_count(&self) -> Result<i64> {
-        Ok(self.db.query_row(
-            "SELECT COUNT(*) FROM checkpoints WHERE synced = 0",
-            [],
-            |r| r.get(0),
-        )?)
+        self.count_in_state(SyncState::Pending)
     }
 
     pub fn unsynced_in_trace(&self, trace_id: &str) -> Result<i64> {
         Ok(self.db.query_row(
-            "SELECT COUNT(*) FROM checkpoints WHERE synced = 0 AND trace_id = ?1",
-            [trace_id],
+            "SELECT COUNT(*) FROM checkpoints WHERE synced = ?2 AND trace_id = ?1",
+            params![trace_id, SyncState::Pending.code()],
             |r| r.get(0),
         )?)
     }
 
-    /// The server refused this checkpoint permanently. It stays restorable
-    /// locally but is no longer retried (`synced = 2`).
-    pub fn mark_rejected(&self, id: &str) -> Result<()> {
-        self.db
-            .execute("UPDATE checkpoints SET synced = 2 WHERE id = ?1", [id])?;
-        Ok(())
+    /// Checkpoints of a trace that exist only on this machine: pending or
+    /// refused by the server.
+    pub fn local_only_in_trace(&self, trace_id: &str) -> Result<i64> {
+        Ok(self.db.query_row(
+            "SELECT COUNT(*) FROM checkpoints WHERE synced != ?2 AND trace_id = ?1",
+            params![trace_id, SyncState::Synced.code()],
+            |r| r.get(0),
+        )?)
     }
 
     pub fn rejected_count(&self) -> Result<i64> {
-        Ok(self.db.query_row(
-            "SELECT COUNT(*) FROM checkpoints WHERE synced = 2",
-            [],
-            |r| r.get(0),
-        )?)
-    }
-
-    pub fn mark_synced(&self, id: &str) -> Result<()> {
-        self.db
-            .execute("UPDATE checkpoints SET synced = 1 WHERE id = ?1", [id])?;
-        Ok(())
+        self.count_in_state(SyncState::Refused)
     }
 
     // -- holds ------------------------------------------------------------------
@@ -787,5 +858,30 @@ impl Store {
     pub fn kv_delete(&self, key: &str) -> Result<()> {
         self.db.execute("DELETE FROM kv WHERE key = ?1", [key])?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SyncState::{self, *};
+
+    #[test]
+    fn sync_state_codes_match_stored_values() {
+        for (s, n) in [(Pending, 0), (Synced, 1), (Refused, 2)] {
+            assert_eq!(s.code(), n);
+            assert_eq!(SyncState::from_code(n).unwrap(), s);
+        }
+        assert!(SyncState::from_code(3).is_err());
+    }
+
+    #[test]
+    fn sync_state_moves() {
+        assert!(Pending.check(Synced).is_ok());
+        assert!(Pending.check(Refused).is_ok());
+        assert!(Synced.check(Pending).is_ok());
+        assert!(Synced.check(Synced).is_ok());
+        assert!(Refused.check(Synced).is_err());
+        assert!(Synced.check(Refused).is_err());
+        assert!(Refused.check(Pending).is_err());
     }
 }

@@ -15,6 +15,7 @@ use serde::de::DeserializeOwned;
 
 use crate::config;
 use crate::error::{Failure, Result};
+use crate::store::SyncState;
 use crate::workspace::{FileLock, Workspace};
 use crate::{err, fail};
 
@@ -452,7 +453,7 @@ pub fn sync(ws: &Workspace, remote: &Remote) -> Result<SyncReport> {
                 ) =>
             {
                 ws.store.tx(|| {
-                    ws.store.mark_rejected(&ck.id)?;
+                    ws.store.set_sync_state(&ck.id, SyncState::Refused)?;
                     ws.store.record_failure(
                         Some(&ck.context_id),
                         f.code.as_str(),
@@ -468,7 +469,7 @@ pub fn sync(ws: &Workspace, remote: &Remote) -> Result<SyncReport> {
         // The server verified the closure: remember it to skip next time.
         ws.store.tx(|| {
             ws.store.mark_remote(&sent)?;
-            ws.store.mark_synced(&ck.id)
+            ws.store.set_sync_state(&ck.id, SyncState::Synced)
         })?;
         report.pushed_checkpoints += 1;
     }
@@ -526,7 +527,7 @@ pub fn pull(ws: &Workspace, remote: &Remote, report: &mut SyncReport) -> Result<
                 report.pulled_traces += 1;
             }
             for c in &ch.checkpoints {
-                ws.store.insert_checkpoint(c, true)?;
+                ws.store.insert_checkpoint(c, SyncState::Synced)?;
                 report.pulled_checkpoints += 1;
             }
             ws.store.kv_set("pull_cursor", &ch.next.to_string())?;

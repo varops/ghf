@@ -1397,6 +1397,7 @@ pub fn prune(env: &Env, dry_run: bool) -> Result<Out> {
 
 /// Drop local payloads of pruned traces (or, with no server, of eligible
 /// fully-local traces), keeping fork bases, then collect unreferenced objects.
+/// With a server, a trace holding pending or refused checkpoints is kept.
 fn prune_local(ws: &Workspace, dry_run: bool, has_server: bool) -> Result<Value> {
     let now = ghf_proto::id::now_ms();
     let policy = policy(ws)?;
@@ -1405,8 +1406,10 @@ fn prune_local(ws: &Workspace, dry_run: bool, has_server: bool) -> Result<Value>
     let mut keep: Vec<String> = Vec::new();
     for t in &traces {
         let prunable = if has_server {
-            // The server decides; never drop anything not yet uploaded.
-            t.record.state == TraceState::Pruned && ws.store.unsynced_in_trace(&t.record.id)? == 0
+            // The server decides. Never drop a checkpoint that exists only
+            // here: pending ones are not uploaded yet, refused ones never
+            // will be.
+            t.record.state == TraceState::Pruned && ws.store.local_only_in_trace(&t.record.id)? == 0
         } else {
             t.record.state == TraceState::Pruned
                 || retention::eligibility(&t.record, now, &policy).eligible

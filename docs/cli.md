@@ -251,7 +251,7 @@ Holds stop pruning. `pin` is the hold named `pin`. Data: `{trace}`.
 Asks the server to prune this repository, then drops local copies of pruned traces and collects unreferenced local objects.
 
 - **Without a server,** it applies the `.ghf` `[retention]` policy locally.
-- **Unsynced checkpoints** are never dropped.
+- **Checkpoints that exist only on this machine** are never dropped: those not yet synced, and those the server refused. A trace holding any of them keeps all its checkpoints, even after the server pruned it.
 
 Data: `{dry_run, server, local}`.
 
